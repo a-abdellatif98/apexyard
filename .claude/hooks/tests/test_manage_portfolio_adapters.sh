@@ -3,7 +3,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-mkdir -p "$TMP/workspace/ok"
+mkdir -p "$TMP/workspace/ok/.claude"
+printf '{}\n' > "$TMP/workspace/ok/.claude/settings.json"
 cat > "$TMP/registry.yaml" <<YAML
 version: 1
 projects:
@@ -30,3 +31,9 @@ projects:
 YAML
 "$ROOT/bin/manage-portfolio-adapters.sh" --check --registry "$TMP/registry-repoless.yaml" >"$TMP/repoless-out"
 grep -q 'OK repoless: no workspace; skipped' "$TMP/repoless-out"
+# Codex generation uses the framework source root and may target a project
+# that has no local .claude/settings.json.
+mkdir -p "$TMP/target"
+"$ROOT/bin/sync-codex-adapter.sh" --root "$ROOT" --target-root "$TMP/target" >/dev/null
+[ -f "$TMP/target/.codex/hooks.json" ]
+[ -f "$TMP/target/.codex/apexyard-adapter.json" ]

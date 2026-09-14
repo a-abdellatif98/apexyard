@@ -43,8 +43,8 @@ while IFS= read -r row; do
     case "$adapter" in
       claude) [ -d "$project_root/.claude" ] && result=ok || result=missing;;
       codex)
-        if [ "$MODE" = install ]; then bash "$FRAMEWORK_ROOT/bin/sync-codex-adapter.sh" --root "$project_root" >/dev/null; result=installed
-        elif { [ -f "$project_root/.codex/apexyard-adapter.json" ] || { [ -d "$project_root/.agents/skills" ] && [ -d "$project_root/.codex/agents" ] && [ -f "$project_root/.codex/hooks.json" ]; }; } && bash "$FRAMEWORK_ROOT/bin/sync-codex-adapter.sh" --root "$project_root" --check-installed >/dev/null 2>&1; then result=ok
+        if [ "$MODE" = install ]; then bash "$FRAMEWORK_ROOT/bin/sync-codex-adapter.sh" --root "$FRAMEWORK_ROOT" --target-root "$project_root" >/dev/null; result=installed
+        elif { [ -f "$project_root/.codex/apexyard-adapter.json" ] || { [ -d "$project_root/.agents/skills" ] && [ -d "$project_root/.codex/agents" ] && [ -f "$project_root/.codex/hooks.json" ]; }; } && bash "$FRAMEWORK_ROOT/bin/sync-codex-adapter.sh" --root "$FRAMEWORK_ROOT" --target-root "$project_root" --check-installed >/dev/null 2>&1; then result=ok
         elif [ -e "$project_root/.codex" ] || [ -e "$project_root/.agents" ]; then result=drift; else result=missing; fi;;
       pi)
         [ ! -L "$project_root/.pi" ] && [ ! -L "$project_root/.pi/extensions" ] || { echo "DRIFT $name: pi adapter path is a symlink"; drift=$((drift+1)); continue; }
