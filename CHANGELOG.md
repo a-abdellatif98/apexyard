@@ -1,3 +1,48 @@
+## [v5.6.2] — 2026-09-14
+
+Patch release — 1 fix.
+
+### Fixed (fix)
+
+- (#1292) handle repo-less adapter registry entries — 08e694b
+
+### Closes
+
+- Closes #1292
+
+## [v5.6.1] — 2026-09-14
+
+Minor release — 2 features, 1 improvement.
+
+### Added (feat)
+
+- (#1289) make harness adapters framework defaults — e466542
+- (#1288) install and audit portfolio harness adapters — bd78903
+
+### Changed (refactor / chore / docs)
+
+- (#1287) record portfolio harness adapter decision — d5ad998
+
+### Closes
+
+- Closes #1286
+
+## [v5.6.0] — 2026-09-14
+
+Minor release — 1 feature, 1 improvement.
+
+### Added (feat)
+
+- (#1288) install and audit portfolio harness adapters — bd78903
+
+### Changed (refactor / chore / docs)
+
+- (#1287) record portfolio harness adapter decision — d5ad998
+
+### Closes
+
+- Closes #1286
+
 ## [v5.5.2] — 2026-09-13
 
 Patch release — 6 fixes, 2 improvements.
