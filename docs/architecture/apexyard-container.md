@@ -70,7 +70,7 @@ The diagram captures which "container" does what *when interpreted by the right 
 
 - Specific hook-to-rule mapping (which hook enforces which rule) — see `docs/rule-audit.md` for that.
 - The full list of 66 skills — see CLAUDE.md § "Available skills".
-- The full list of 19 roles — see `.claude/rules/role-triggers.md`.
+- The full list of 20 roles — see `.claude/rules/role-triggers.md`.
 - The user's local `workspace/<name>/` clones of managed projects — they're gitignored and sit outside the ApexYard boundary (they belong to the managed project, not to ApexYard).
 
 ## Related diagrams
@@ -116,3 +116,5 @@ The C4 containers stay the same. The CLAUDE.md → rules arrow is now index-plus
 **2026-09-18 — Dispatch merge gates inside command wrappers (AgDR-0162, me2resh/apexyard#1338).** The Bash dispatcher matched merge commands by prefix. `/approve-merge` wraps `tracker_pr_merge` in `bash -c`, so the four merge gates never ran. The dispatcher now also routes when `is_merge_command` matches the full payload command. The C4 containers stay the same. The change is inside the hooks container.
 
 **2026-09-18 — Commit-ref `-C` outranks payload cwd (AgDR-0163, me2resh/apexyard#1340).** `verify-commit-refs.sh` ranked harness `.cwd` above a this-commit `git -C` path. Claude Code and Cursor always send `.cwd`, so the `#1050` parser never ran. The hook now ranks the message-stripped, this-invocation scrape first. Payload `.cwd` stays the default when the command has no `-C` or `cd`. The C4 containers stay the same. The change is inside the hooks container.
+
+**2026-09-18 — v5.6.3 count and docs refresh (me2resh/apexyard#1345).** Live summaries now say 60 non-lib hooks, 66 skills, 23 agents, 22 rules, and 20 roles. The C4 roles container count moved from 19 to 20. `/release-sync` for v5.6.2 made `main` an ancestor of `dev`. The C4 containers stay the same.
