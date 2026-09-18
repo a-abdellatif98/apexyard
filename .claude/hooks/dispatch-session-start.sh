@@ -31,12 +31,36 @@ run_direct() {
   fi
 }
 
+# The hooks that run after pin-ops-root.sh. The concurrent path and the
+# mktemp-failure fallback both read this one list. The
+# APEXYARD_SESSION_START_HOOK comments above must name the same scripts, plus
+# pin-ops-root.sh. test_dispatch_session_start.sh fails when they disagree.
+scripts=(
+  onboarding-check.sh
+  check-upstream-drift.sh
+  check-jq-installed.sh
+  check-git-hooks-installed.sh
+  check-portfolio-config.sh
+  clear-bootstrap-marker.sh
+  clear-active-reviewer-marker.sh
+  clear-onboarding-depth-mode-marker.sh
+  clear-onboarding-glossary-seen-marker.sh
+  clear-issue-skill-marker.sh
+  link-custom-skills.sh
+  apply-agent-routing.sh
+  remind-mcp-tools.sh
+  validate-search-config.sh
+  print-portfolio-primer.sh
+  reindex-on-session-start.sh
+  warn-unqualified-review-marker.sh
+)
+
 # Pinning is the one ordering dependency. Run it before the remaining hooks.
 run_direct pin-ops-root.sh
 
 if ! TMP_DIR=$(mktemp -d 2>/dev/null); then
   printf '%s\n' 'WARN: could not create SessionStart output directory; running remaining hooks directly.' >&2
-  for script in onboarding-check.sh check-upstream-drift.sh check-jq-installed.sh check-git-hooks-installed.sh check-portfolio-config.sh clear-bootstrap-marker.sh clear-active-reviewer-marker.sh clear-onboarding-depth-mode-marker.sh clear-onboarding-glossary-seen-marker.sh clear-issue-skill-marker.sh link-custom-skills.sh apply-agent-routing.sh remind-mcp-tools.sh validate-search-config.sh print-portfolio-primer.sh reindex-on-session-start.sh warn-unqualified-review-marker.sh; do
+  for script in "${scripts[@]}"; do
     run_direct "$script"
   done
   exit 0
@@ -52,35 +76,24 @@ run_hook() {
   printf '%s' "$rc" >"$TMP_DIR/$slot.rc"
 }
 
+# A slot can lose its result files if its run_hook subshell dies before it
+# writes them. Report what exists, treat a missing or non-numeric exit code
+# as a failure, and keep reporting the remaining slots.
 report_hook() {
-  local script="$1" slot="$2" rc
-  cat "$TMP_DIR/$slot.out"
-  cat "$TMP_DIR/$slot.err" >&2
-  rc=$(cat "$TMP_DIR/$slot.rc")
-  if [ "$rc" -ne 0 ]; then
-    printf 'WARN: SessionStart hook %s exited %s; continuing.\n' "$script" "$rc" >&2
-  fi
+  local script="$1" slot="$2" rc=""
+  if [ -f "$TMP_DIR/$slot.out" ]; then cat "$TMP_DIR/$slot.out"; fi
+  if [ -f "$TMP_DIR/$slot.err" ]; then cat "$TMP_DIR/$slot.err" >&2; fi
+  if [ -f "$TMP_DIR/$slot.rc" ]; then rc=$(cat "$TMP_DIR/$slot.rc"); fi
+  case "$rc" in
+    ''|*[!0-9]*)
+      printf 'WARN: SessionStart hook %s left no exit status; treating it as failed; continuing.\n' "$script" >&2
+      ;;
+    0) ;;
+    *)
+      printf 'WARN: SessionStart hook %s exited %s; continuing.\n' "$script" "$rc" >&2
+      ;;
+  esac
 }
-
-scripts=(
-  onboarding-check.sh \
-  check-upstream-drift.sh \
-  check-jq-installed.sh \
-  check-git-hooks-installed.sh \
-  check-portfolio-config.sh \
-  clear-bootstrap-marker.sh \
-  clear-active-reviewer-marker.sh \
-  clear-onboarding-depth-mode-marker.sh \
-  clear-onboarding-glossary-seen-marker.sh \
-  clear-issue-skill-marker.sh \
-  link-custom-skills.sh \
-  apply-agent-routing.sh \
-  remind-mcp-tools.sh \
-  validate-search-config.sh \
-  print-portfolio-primer.sh \
-  reindex-on-session-start.sh \
-  warn-unqualified-review-marker.sh
-)
 
 pids=()
 names=()
