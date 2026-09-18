@@ -6,7 +6,7 @@ Claude Code is ApexYard's reference harness. Nothing is translated: `CLAUDE.md` 
 
 ## What "full experience" means
 
-- **`CLAUDE.md` auto-load** — the Chief-of-Staff framing, SDLC, workflow gates, and the `@.claude/rules/*.md` imports are loaded into every session without any manual step.
+- **`CLAUDE.md` auto-load** — the Chief-of-Staff framing, SDLC, workflow gates, and a named index of `.claude/rules/` load at session start. Rule bodies load on demand. See AgDR-0160.
 - **Mechanical gates fire on every tool call** — the `.claude/hooks/*.sh` scripts wire to `PreToolUse` / `PostToolUse` / `SessionStart` via `.claude/settings.json` and block (exit 2) or advise (exit 0) in real time.
 - **Slash-command skills** — each `.claude/skills/<name>/SKILL.md` is a typed `/command` (e.g. `/start-ticket`, `/decide`, `/code-review`, `/approve-merge`).
 - **Sub-agents** — Rex (code review), Hakim (security), Tariq (design review), Naqid (the contrarian), plus the department personas, each spawned via the `Agent` tool with role-scoped tools.
@@ -20,7 +20,7 @@ Claude Code is ApexYard's reference harness. Nothing is translated: `CLAUDE.md` 
 
 ## How it works (transport)
 
-There is no transport layer — Claude Code *is* the runtime the other adapters shell out to. The hooks read tool-call JSON on stdin, decide, and return an exit code Claude Code honors directly. `.claude/` is the canonical authoring surface for every other harness precisely because it is executed natively here.
+There is no transport layer for Claude Code itself. Cursor can load the same `.claude/` files when third-party configs are on. See [cursor.md](cursor.md). The hooks read tool-call JSON on stdin, decide, and return an exit code the harness honors. `.claude/` is the canonical authoring surface for every other harness because Claude Code executes it natively.
 
 ## How to install
 
