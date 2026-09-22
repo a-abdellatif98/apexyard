@@ -51,6 +51,24 @@ expect_eq "$(get 11 .unknown)" '["new_in_scope","mine_new_comment","reviewer_wai
 expect_eq "$(get 12 .matched)" '["new_in_scope"]' "offset timestamps with fractions compare by instant"
 expect_eq "$(get 13 .owned)" "false" "an offset timestamp before the scope instant is out of scope"
 
+odd="$SANDBOX/odd.json"
+echo "[{\"id\": \"20\", \"created\": \"2026-01-04T09:00:00\", \"assignee_id\": \"u-me\", $K},
+       {\"id\": \"21\", \"created\": \"2026-01-01T09:00:00Z\", \"assignee_id\": \"u-me\",
+        \"last_comment_at\": \"yesterday\", \"last_comment_author_id\": \"u-reviewer\", $K}]" > "$odd"
+out3=$("$DUTY" partition "$odd" "$state" "u-me"); rc=$?
+expect_eq "$rc" "0" "one unparseable item does not break the partition"
+expect_eq "$(printf '%s' "$out3" | jq -c '.[] | select(.id == "20") | .unknown')" '["new_in_scope"]' \
+  "an unparseable creation time is unknown, not false"
+expect_eq "$(printf '%s' "$out3" | jq -c '.[] | select(.id == "21") | .unknown')" '["mine_new_comment"]' \
+  "an unparseable comment time is unknown, not false"
+
+"$DUTY" init "$SANDBOX/bad-scope.json" "2026-01-04 08:00" 2>/dev/null; rc=$?
+expect_eq "$rc" "2" "init refuses an unparseable scope timestamp"
+jq '.shift.scope_timestamp = "2026-01-04 08:00"' "$state" > "$SANDBOX/bad-state.json"
+"$DUTY" partition "$SANDBOX/items.json" "$SANDBOX/bad-state.json" "u-me" >/dev/null 2>&1; rc=$?
+expect_eq "$([ "$rc" -ne 0 ] && echo failed || echo "passed silently")" "failed" \
+  "a corrupt scope timestamp fails loudly instead of printing nothing"
+
 display="$SANDBOX/display.json"
 echo "[{\"id\": \"10\", \"created\": \"2026-01-04T09:00:00Z\", \"assignee_id\": \"u-namesake\",
         \"assignee_name\": \"Same Name\", $K}]" > "$display"

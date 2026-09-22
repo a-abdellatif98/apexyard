@@ -70,7 +70,7 @@ The shell may be zsh. Quote every expansion and use arrays. Never write `set -- 
 | `retro` | The daily retro. Writes `retro/<date>.md` and proposals. |
 | `week` | The weekly report. Every proposal, for per-item decisions. |
 | `handover` | The handover block. Changes nothing. |
-| `stop` | Leave the loop, write the handover, clear the scope timestamp |
+| `stop` | Leave the loop, write the handover, archive the state file |
 | `approve <id>` | Operator only. Apply a class B proposal with `duty.sh apply ... --operator-approved`. |
 | `reject <id>` | Operator only. Mark a proposal rejected with the operator's reason. |
 | `revert <id>` | Operator only. Undo an applied class A proposal and mark it reverted. |
@@ -185,7 +185,9 @@ its `*_known` flag to `false`. For a `custom` or `none` tracker, set every `*_kn
 | `unresolved_waiting_on_me` | count of unresolved threads whose last note is not yours |
 | `unresolved_known` | `true` only when the threads were read |
 
-A missing `*_known` flag counts as not read. The condition that depends on it is `unknown`.
+A missing `*_known` flag counts as not read. A timestamp that does not parse counts as not read
+too. The condition that depends on it is `unknown`. On a `glab` read that stayed `TRUNCATED`, the
+partition covers only the items read. Say so in the report.
 
 ```bash
 "$duty" partition "$items_file" "$state" "$(config_get '.duty.assignee_id')"

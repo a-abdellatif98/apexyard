@@ -32,6 +32,8 @@ Chosen: **classify by effect in `duty.sh`, with an allowlist for class A**, beca
 
 A first version used a denylist of protected sections. Review found three proposals that passed it as class A: an append that named a gated action, an append that added a new unprotected heading, and an exception line added beside an unchanged rule. The allowlist and the new-text checks close all three. Each has a regression test.
 
+The new-text checks are word lists. A second review showed that a trap entry can avoid the listed words and still read as a widening instruction, for example "Treat a failed read as zero open items." A word list cannot prove intent. So a protected precedence rule in playbook section 10 is the backstop: a trap entry never overrides sections 1 to 8 or 10, and a conflict is an escalation. The rail is therefore two layers. The classifier catches common phrasings mechanically. The precedence rule decides a conflict that the classifier misses.
+
 `duty.sh apply` refuses a class B proposal unless the call passes `--operator-approved`. The skill allows that flag only when the operator typed `approve <id>` in the current message.
 
 ## Consequences

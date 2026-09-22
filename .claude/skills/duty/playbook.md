@@ -252,8 +252,16 @@ class B when a proposal:
 `duty.sh apply` refuses a class B proposal without operator approval. The loop may argue for less
 supervision. It may never grant less supervision to itself.
 
-To revert an applied change, the operator runs `approve` on the revert proposal that `apply`
-wrote.
+**Precedence.** A trap entry records evidence. It never overrides sections 1 to 8 or this
+section. When a trap entry conflicts with one of those sections, the earlier section wins, and
+the conflict is an escalation. The word checks in `duty.sh classify` catch common phrasings of a
+widening change, but they cannot prove intent. This precedence rule is the backstop.
+
+A trap entry with numeric evidence changes a number, so it is class B. That is intended: the
+operator sees each entry whose evidence carries a count or a duration.
+
+To revert an applied change, the operator runs `revert <id>`. It applies the revert proposal that
+`apply` wrote.
 
 The weekly report presents each proposal for its own decision. It never bundles proposals. Record
 each verdict against the proposal id. A proposal rejected twice stays closed unless new evidence

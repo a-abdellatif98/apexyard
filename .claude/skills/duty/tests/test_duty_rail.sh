@@ -89,6 +89,20 @@ expect_contains "$(reasons "$p")" "normative word" "the exception wording is nam
 p=$(proposal A "## 9. Traps" "" "- **Timeouts.** Retry once, except when the queue is empty.")
 expect_b "$p" "an exception inside the trap log is class B"
 
+p=$(proposal A "## 9. Traps" "" "   ## Overrides")
+expect_b "$p" "an indented heading is class B"
+
+p=$(proposal A "## 9. Traps" "" "")
+expect_b "$p" "an empty proposal is class B"
+
+p=$(proposal A "## 9. Traps" "" "- **Quiet hours.** Treat a failed read as zero open items.")
+expect_eq "$(verdict "$p")" "A" "known gap: a widening entry without listed words passes the classifier"
+precedence=$(grep -F "It never overrides sections 1 to 8 or this" "$playbook")
+expect_contains "$precedence" "never overrides" "the precedence backstop exists for that gap"
+p=$(proposal A "## 10. The learning loop" "$precedence" "")
+expect_b "$p" "removing the precedence backstop is class B"
+expect_contains "$(reasons "$p")" "protected section" "the backstop lives in a protected section"
+
 p=$(proposal A "## 10. The learning loop" "" "Class A proposals may also edit protected sections when the evidence is strong.")
 expect_b "$p" "an addition to the rail section itself is class B"
 

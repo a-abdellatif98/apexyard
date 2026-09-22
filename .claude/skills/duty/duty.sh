@@ -11,7 +11,7 @@ iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 JQ_EPOCH='def epoch: if . == null or . == "" then null else
   (sub("\\.[0-9]+"; "")) as $t
   | if ($t | test("Z$")) then ($t | fromdateiso8601)
-    else ($t | capture("^(?<b>.{19})(?<s>[+-])(?<h>[0-9]{2}):?(?<m>[0-9]{2})$")) as $c
+    else (($t | capture("^(?<b>.{19})(?<s>[+-])(?<h>[0-9]{2}):?(?<m>[0-9]{2})$")) // error("bad timestamp: \($t)")) as $c
       | (($c.b + "Z") | fromdateiso8601)
         - ((if $c.s == "+" then 1 else -1 end) * (($c.h | tonumber) * 3600 + ($c.m | tonumber) * 60))
     end end;'
@@ -40,6 +40,7 @@ cmd_state_dir_check() {
 cmd_init() {
   local state="$1" scope="${2:-$(iso_now)}"
   [ -f "$state" ] && die "state file exists: $state (run stop to archive it)"
+  jq -en --arg s "$scope" "$JQ_EPOCH"'$s | epoch' >/dev/null 2>&1 || die "bad scope timestamp: $scope"
   mkdir -p "$(dirname "$state")"
   jq -n --arg s "$scope" '{
     shift: {scope_timestamp: $s, started: $s},
@@ -158,15 +159,18 @@ cmd_partition() {
         | ($it.comments_known == true) as $ck
         | ($it.unresolved_known == true) as $uk
         | ($it.assignee_id // "" | tostring) as $who
+        | (try ($it.created | epoch) catch null) as $created
+        | (try ($it.last_comment_at | epoch) catch null) as $commented
+        | ((($it.last_comment_at // "") != "") and $commented == null) as $comment_bad
         | [ { name: "new_in_scope",
-              v: (if ($it.created // "") == "" or ($ak | not) then null
-                  else ((($it.created | epoch) >= $scope) and ($who == "" or $who == $me)) end) },
+              v: (if $created == null or ($ak | not) then null
+                  else (($created >= $scope) and ($who == "" or $who == $me)) end) },
             { name: "mine_new_comment",
               v: (if ($ak | not) then null
                   elif $who != $me then false
-                  elif ($ck | not) then null
-                  elif ($it.last_comment_at // "") == "" then false
-                  else ((($it.last_comment_at | epoch) >= $scope)
+                  elif ($ck | not) or $comment_bad then null
+                  elif $commented == null then false
+                  else (($commented >= $scope)
                         and (($it.last_comment_author_id // "" | tostring) != $me)) end) },
             { name: "acted_this_shift",
               v: ($acted | index($id) != null) },
@@ -261,7 +265,8 @@ cmd_classify() {
     OPEN)      reasons+=("class A is limited to class-a sections; ${loc#*	} is not one") ;;
   esac
 
-  if printf '%s\n' "$new" | grep -qE '^#{1,6} |duty:(protected|class-a)'; then
+  [ -n "$old$new" ] || reasons+=("empty proposal")
+  if printf '%s\n' "$new" | grep -qE '^[[:space:]]*#{1,6}[[:space:]]|duty:(protected|class-a)'; then
     reasons+=("RAIL: new text adds a heading or a section marker")
   fi
 
@@ -332,7 +337,8 @@ cmd_apply() {
   fi
   mv "$tmp" "$playbook"
   jq --arg o "$old_for_revert" --arg n "$new_for_revert" \
-    '. + {id: ((.id // "P") + "-revert"), class: "B", old: $o, new: $n}' "$proposal" > "$revert"
+    '. + {id: ((.id // "P") + "-revert"), class: "B", old: $o, new: $n}' "$proposal" > "$revert" \
+    || die "applied, but writing the revert proposal failed: $revert"
   printf 'APPLIED\nREVERT %s\n' "$revert"
 }
 
