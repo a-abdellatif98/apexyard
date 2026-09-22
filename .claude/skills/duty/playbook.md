@@ -7,8 +7,9 @@ rule, with identifiers removed.
 Copy this file to your private portfolio and set `duty.playbook` in `.claude/project-config.json`
 to its path before you edit it. Edits to the shipped copy conflict with `/update`.
 
-A section that carries the `duty:protected` marker is protected. The retro must not change a
-protected section without operator approval. The helper `duty.sh classify` enforces this.
+A section that carries the `duty:protected` marker is protected. Only a section that carries the
+`duty:class-a` marker accepts a change without operator approval. Section 10 has the full rule,
+and `duty.sh classify` enforces it.
 
 ---
 
@@ -79,8 +80,11 @@ it at the next tick. Evidence: four correct revisions in one hour drove zero ite
 
 ## 4. Reading the tracker
 
-Every tracker call goes through `.claude/hooks/_lib-tracker.sh`. Identifiers come from
-`.claude/project-config.json`, never from this file.
+List and view calls go through `.claude/hooks/_lib-tracker.sh`. That library does not return
+creation time, comments, or review threads. Read those fields with a read-only call to the CLI
+that `tracker_kind` names, and never write through that CLI. For a `custom` or `none` tracker,
+set every `*_known` flag to `false`. Identifiers come from `.claude/project-config.json`, never
+from this file.
 
 - **A short read looks exactly like a complete read.** Only a result below the requested limit
   proves the end. Run `duty.sh fetch-status <rc> <count> <limit>`. On `TRUNCATED`, double the limit
@@ -204,6 +208,8 @@ you did not read is an assumption.
 
 ## 9. Traps
 
+<!-- duty:class-a -->
+
 Add a trap here when it produced a confident wrong claim or cost more than an hour. Lead with the
 rule and keep the incident below it as evidence.
 
@@ -227,18 +233,27 @@ Three artifacts, all in the state directory, outside every repository:
 The retro answers four questions: what the shift delivered, what went wrong and why, what would
 have prevented it, and what this playbook said that was wrong, missing, or ignored.
 
-**Class A** corrects something demonstrably false. It applies immediately and records a revert
-path. **Class B** is anything new. It waits for per-item operator approval. An unclear case is
-class B.
+**Class A** is a factual entry or correction in a section that carries the `duty:class-a` marker.
+Only the trap log in section 9 carries it. A class A proposal applies immediately, and `duty.sh
+apply` writes a revert proposal beside it. **Class B** is everything else, including a correction
+to any other section. It waits for per-item operator approval. An unclear case is class B.
 
-**The rail.** Classify a proposal by its effect, not by its framing. A proposal whose effect
-reduces supervision is class B, however correct its premise. That includes a change to a protected
-section, a changed threshold or cadence, a removed or rewritten normative line, and any text that
-widens unattended action. `duty.sh classify` checks these conditions, and `duty.sh apply` refuses a
-class B proposal without operator approval. The loop may argue for less supervision. It may never
-grant less supervision to itself.
+**The rail.** Classify a proposal by its effect, not by its framing. `duty.sh classify` returns
+class B when a proposal:
 
-Additions to the trap log in section 9 are class A when they pass `duty.sh classify`.
+- targets any section without the `duty:class-a` marker
+- adds a heading or a section marker
+- adds a normative word, such as never, must, only, except, or instead
+- removes or rewrites a normative line
+- changes any number
+- names a gated action, such as merge, approve, resolve, force, push, deploy, or delete, or
+  widens unattended action.
+
+`duty.sh apply` refuses a class B proposal without operator approval. The loop may argue for less
+supervision. It may never grant less supervision to itself.
+
+To revert an applied change, the operator runs `approve` on the revert proposal that `apply`
+wrote.
 
 The weekly report presents each proposal for its own decision. It never bundles proposals. Record
 each verdict against the proposal id. A proposal rejected twice stays closed unless new evidence

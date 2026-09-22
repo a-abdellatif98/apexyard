@@ -7,6 +7,15 @@ need_jq() { command -v jq >/dev/null 2>&1 || die "jq is required"; }
 
 iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
+# jq helper: ISO-8601 with optional fractional seconds and Z or +HH:MM offset -> epoch.
+JQ_EPOCH='def epoch: if . == null or . == "" then null else
+  (sub("\\.[0-9]+"; "")) as $t
+  | if ($t | test("Z$")) then ($t | fromdateiso8601)
+    else ($t | capture("^(?<b>.{19})(?<s>[+-])(?<h>[0-9]{2}):?(?<m>[0-9]{2})$")) as $c
+      | (($c.b + "Z") | fromdateiso8601)
+        - ((if $c.s == "+" then 1 else -1 end) * (($c.h | tonumber) * 3600 + ($c.m | tonumber) * 60))
+    end end;'
+
 cfg_num() {
   local key="$1" fallback="$2" v=""
   if [ -n "${DUTY_CONFIG_JSON:-}" ]; then
@@ -30,13 +39,23 @@ cmd_state_dir_check() {
 
 cmd_init() {
   local state="$1" scope="${2:-$(iso_now)}"
-  [ -f "$state" ] && die "state file exists: $state"
+  [ -f "$state" ] && die "state file exists: $state (run stop to archive it)"
   mkdir -p "$(dirname "$state")"
   jq -n --arg s "$scope" '{
     shift: {scope_timestamp: $s, started: $s},
     last_watcher_tick: null, last_review_tick: null,
-    items: {}, actions: [], proposals_seen: []
+    items: {}, actions: []
   }' > "$state"
+}
+
+cmd_stop() {
+  local state="$1" at="${2:-$(iso_now)}" dest
+  [ -f "$state" ] || die "no state file: $state"
+  dest="$(dirname "$state")/archive/state-${at//:/}.json"
+  mkdir -p "$(dirname "$dest")"
+  jq --arg at "$at" '.shift.stopped = $at' "$state" > "$dest" || die "archive failed"
+  rm -f "$state"
+  printf '%s\n' "$dest"
 }
 
 cmd_liveness() {
@@ -44,9 +63,9 @@ cmd_liveness() {
   local w_stale r_stale
   w_stale=$(cfg_num watcher_stale_minutes 45)
   r_stale=$(cfg_num review_stale_minutes 90)
-  jq -r --arg now "$now" --argjson ws "$w_stale" --argjson rs "$r_stale" '
+  jq -r --arg now "$now" --argjson ws "$w_stale" --argjson rs "$r_stale" "$JQ_EPOCH"'
     def age($f): if .[$f] == null then null
-      else (((($now | fromdateiso8601) - (.[$f] | fromdateiso8601)) / 60) | floor) end;
+      else (((($now | epoch) - (.[$f] | epoch)) / 60) | floor) end;
     if .shift.scope_timestamp == null then "NO_SHIFT"
     else
       [ (age("last_watcher_tick") as $a
@@ -60,12 +79,11 @@ cmd_liveness() {
 }
 
 cmd_plan() {
-  local state="$1" now="${2:-$(iso_now)}" interval
+  local state="$1" now="${2:-$(iso_now)}" interval due
   interval=$(cfg_num review_interval_minutes 30)
-  local due
-  due=$(jq -r --arg now "$now" --argjson iv "$interval" '
+  due=$(jq -r --arg now "$now" --argjson iv "$interval" "$JQ_EPOCH"'
     if .last_review_tick == null then "yes"
-    elif ((($now | fromdateiso8601) - (.last_review_tick | fromdateiso8601)) / 60) >= $iv
+    elif ((($now | epoch) - (.last_review_tick | epoch)) / 60) >= $iv
     then "yes" else "no" end' "$state")
   printf '%s\n' liveness watcher stamp_watcher
   [ "$due" = "yes" ] && printf '%s\n' review stamp_review
@@ -73,7 +91,7 @@ cmd_plan() {
 }
 
 cmd_verify_tick() {
-  local log="$1"
+  local log="$1" plan="${2:-}"
   local -a steps=()
   local s
   while IFS= read -r s; do
@@ -93,6 +111,9 @@ cmd_verify_tick() {
   [ "$idx_wstamp" -gt "$idx_watch" ] || { echo "FAILED watcher stamp missing or before watcher"; return 1; }
   if [ "$idx_review" -ge 0 ] && [ "$idx_review" -lt "$idx_wstamp" ]; then
     echo "FAILED review ran before the watcher stamp"; return 1
+  fi
+  if [ -n "$plan" ] && grep -qx review "$plan" && [ "$idx_review" -lt 0 ]; then
+    echo "FAILED planned review pass skipped"; return 1
   fi
   echo "OK"
 }
@@ -116,35 +137,43 @@ cmd_record_action() {
 }
 
 cmd_fetch_status() {
-  local rc="$1" count="$2" limit="$3"
+  local rc="$1" count="$2" limit="$3" cap="${4:-}" effective
   if [ "$rc" != "0" ]; then echo "UNKNOWN"; return 0; fi
   case "$count" in ''|*[!0-9]*) echo "UNKNOWN"; return 0 ;; esac
-  if [ "$count" -lt "$limit" ]; then echo "COMPLETE"; else echo "TRUNCATED"; fi
+  effective="$limit"
+  if [ -n "$cap" ] && [ "$cap" -lt "$limit" ]; then effective="$cap"; fi
+  if [ "$count" -lt "$effective" ]; then echo "COMPLETE"; else echo "TRUNCATED"; fi
 }
 
 cmd_partition() {
   local items="$1" state="$2" me="$3"
-  jq -n --slurpfile items "$items" --slurpfile st "$state" --arg me "$me" '
-    ($st[0].shift.scope_timestamp) as $scope
-    | ($st[0].actions | map(select(.at >= $scope)) | map(.item) | unique) as $acted
+  jq -n --slurpfile items "$items" --slurpfile st "$state" --arg me "$me" "$JQ_EPOCH"'
+    ($st[0].shift.scope_timestamp | epoch) as $scope
+    | ($st[0].actions | map(select((.at | epoch) >= $scope)) | map(.item | tostring) | unique) as $acted
     | ($items[0] | if type == "array" then . else [] end)
     | map(
         . as $it
+        | ($it.id | tostring) as $id
+        | ($it.assignee_known == true) as $ak
+        | ($it.comments_known == true) as $ck
+        | ($it.unresolved_known == true) as $uk
+        | ($it.assignee_id // "" | tostring) as $who
         | [ { name: "new_in_scope",
-              v: (if $it.created == null or $it.assignee_known == false then null
-                  else (($it.created >= $scope)
-                        and (($it.assignee_id // "") == "" or $it.assignee_id == $me)) end) },
+              v: (if ($it.created // "") == "" or ($ak | not) then null
+                  else ((($it.created | epoch) >= $scope) and ($who == "" or $who == $me)) end) },
             { name: "mine_new_comment",
-              v: (if $it.assignee_known == false then null
-                  else ($it.assignee_id == $me
-                        and (($it.last_comment_at // "") >= $scope)
-                        and (($it.last_comment_author_id // $me) != $me)) end) },
+              v: (if ($ak | not) then null
+                  elif $who != $me then false
+                  elif ($ck | not) then null
+                  elif ($it.last_comment_at // "") == "" then false
+                  else ((($it.last_comment_at | epoch) >= $scope)
+                        and (($it.last_comment_author_id // "" | tostring) != $me)) end) },
             { name: "acted_this_shift",
-              v: ($acted | index($it.id) != null) },
+              v: ($acted | index($id) != null) },
             { name: "reviewer_waiting",
-              v: (if $it.unresolved_known == false then null
+              v: (if ($uk | not) then null
                   else (($it.unresolved_waiting_on_me // 0) > 0) end) } ]
-        | { id: $it.id,
+        | { id: $id,
             matched: map(select(.v == true) | .name),
             unknown: map(select(.v == null) | .name),
             owned: (map(select(.v == true)) | length > 0) }
@@ -188,49 +217,58 @@ cmd_handover_items() {
     | .[] | "\(.value.state)\t\(.key)\t\(.value.reason // "")"' "$1"
 }
 
-section_of() {
-  local playbook="$1" text="$2"
-  DUTY_NEEDLE="$text" awk '
-    BEGIN { needle = ENVIRON["DUTY_NEEDLE"] }
-    /^## / { sec = $0; prot = 0 }
-    /<!-- duty:protected -->/ { prot = 1 }
-    { buf[sec] = buf[sec] "\n" $0; p[sec] = p[sec] || prot }
-    END { for (s in buf) if (index(buf[s], needle) > 0) { print (p[s] ? "PROTECTED" : "OPEN") "\t" s; exit } }
+# Prints "<CLASS>\t<heading>" for the section holding the needle (mode text)
+# or named by the needle (mode heading). CLASS is PROTECTED, CLASSA, or OPEN.
+section_class() {
+  local playbook="$1" mode="$2" needle="$3"
+  DUTY_MODE="$mode" DUTY_NEEDLE="$needle" awk '
+    BEGIN { mode = ENVIRON["DUTY_MODE"]; needle = ENVIRON["DUTY_NEEDLE"]; n = 0 }
+    /^## / { sec = $0; order[++n] = sec }
+    /<!-- duty:protected -->/ { prot[sec] = 1 }
+    /<!-- duty:class-a -->/ { cla[sec] = 1 }
+    { buf[sec] = buf[sec] "\n" $0 }
+    END {
+      if (needle == "") exit
+      for (i = 1; i <= n; i++) {
+        s = order[i]
+        hit = (mode == "heading") ? (s == needle) : (index(buf[s], needle) > 0)
+        if (hit) { print (prot[s] ? "PROTECTED" : (cla[s] ? "CLASSA" : "OPEN")) "\t" s; exit }
+      }
+    }
   ' "$playbook"
 }
 
 cmd_classify() {
   local proposal="$1" playbook="$2"
-  local declared old new reasons=()
+  local declared old new section reasons=()
   declared=$(jq -r '.class // "B"' "$proposal")
   old=$(jq -r '.old // ""' "$proposal")
   new=$(jq -r '.new // ""' "$proposal")
+  section=$(jq -r '.section // ""' "$proposal")
 
   [ "$declared" = "A" ] || reasons+=("declared class $declared")
 
-  local loc
+  local loc cls
   if [ -n "$old" ]; then
-    loc=$(section_of "$playbook" "$old")
-    if [ -z "$loc" ]; then
-      reasons+=("old text not found in playbook")
-    elif [ "${loc%%	*}" = "PROTECTED" ]; then
-      reasons+=("RAIL: edits protected section ${loc#*	}")
-    fi
+    loc=$(section_class "$playbook" text "$old")
   else
-    local anchor
-    anchor=$(jq -r '.section // ""' "$proposal")
-    loc=$(DUTY_ANCHOR="$anchor" awk '
-      BEGIN { s = ENVIRON["DUTY_ANCHOR"] }
-      /^## / { cur = $0; prot = 0 }
-      /<!-- duty:protected -->/ { prot = 1 }
-      cur == s && prot { print "PROTECTED"; exit }
-      cur == s { found = 1 }
-      END { if (found) print "OPEN" }' "$playbook" | head -1)
-    [ "$loc" = "PROTECTED" ] && reasons+=("RAIL: adds to protected section $anchor")
-    [ -z "$loc" ] && reasons+=("target section not found")
+    loc=$(section_class "$playbook" heading "$section")
+  fi
+  cls="${loc%%	*}"
+  case "$cls" in
+    "")        reasons+=("target text or section not found") ;;
+    PROTECTED) reasons+=("RAIL: edits protected section ${loc#*	}") ;;
+    OPEN)      reasons+=("class A is limited to class-a sections; ${loc#*	} is not one") ;;
+  esac
+
+  if printf '%s\n' "$new" | grep -qE '^#{1,6} |duty:(protected|class-a)'; then
+    reasons+=("RAIL: new text adds a heading or a section marker")
   fi
 
-  local norm='(never|always|must|do not|don.t|only|halt|stop|escalate|approval|gate|required)'
+  local norm='(never|always|must|shall|should|do not|don.t|only|except|unless|instead|allowed|may |halt|stop|escalate|approv|gate|required|skip)'
+  if printf '%s' "$new" | grep -qiE "$norm"; then
+    reasons+=("RAIL: new text contains a normative word")
+  fi
   local removed
   removed=$(printf '%s\n' "$old" | grep -iE "$norm" | while IFS= read -r l; do
     printf '%s\n' "$new" | grep -qF -- "$l" || printf '%s\n' "$l"
@@ -240,13 +278,13 @@ cmd_classify() {
   local old_nums new_nums
   old_nums=$(printf '%s' "$old" | grep -oE '[0-9]+' | sort | tr '\n' ' ')
   new_nums=$(printf '%s' "$new" | grep -oE '[0-9]+' | sort | tr '\n' ' ')
-  if [ -n "$old" ] && [ "$old_nums" != "$new_nums" ]; then
+  if [ "$old_nums" != "$new_nums" ]; then
     reasons+=("RAIL: changes a number (threshold, cadence, or limit)")
   fi
 
-  local widen='(unattended|without (operator|approval|asking)|skip|disable|relax|loosen|redundant|no longer (need|require)|auto-?(approve|merge|resolve)|drop the (check|gate))'
-  if printf '%s' "$new" | grep -qiE "$widen"; then
-    reasons+=("RAIL: new text widens unattended action or removes a check")
+  local act='(unattended|without (the )?(operator|approval|asking)|disable|relax|loosen|redundant|no longer|merg|approve|resolv|force|push|production|deploy|delete|migrat|yourself|bypass|--no-verify|sudo)'
+  if printf '%s' "$new" | grep -qiE "$act"; then
+    reasons+=("RAIL: new text names a gated action or widens unattended action")
   fi
 
   if [ "${#reasons[@]}" -eq 0 ]; then
@@ -265,31 +303,37 @@ cmd_apply() {
     echo "REFUSED class $verdict needs operator approval"
     return 1
   fi
-  local old new section tmp
+  local old new section tmp revert old_for_revert new_for_revert
   old=$(jq -r '.old // ""' "$proposal")
   new=$(jq -r '.new // ""' "$proposal")
   section=$(jq -r '.section // ""' "$proposal")
+  revert="${proposal%.json}.revert.json"
   tmp=$(mktemp) || die "mktemp failed"
   if [ -z "$old" ]; then
+    [ -n "$new" ] || { rm -f "$tmp"; echo "REFUSED empty proposal"; return 1; }
     DUTY_ANCHOR="$section" DUTY_NEW="$new" awk '
       BEGIN { s = ENVIRON["DUTY_ANCHOR"]; n = ENVIRON["DUTY_NEW"] }
       /^## / && in_s { print n; print ""; done = 1; in_s = 0 }
-      /^## / && $0 == s { in_s = 1 }
+      /^## / && s != "" && $0 == s { in_s = 1 }
       { print }
       END { if (in_s) { print ""; print n; done = 1 } if (!done) exit 3 }
     ' "$playbook" > "$tmp" || { rm -f "$tmp"; echo "REFUSED section not found"; return 1; }
-    mv "$tmp" "$playbook"
-    echo "APPLIED"
-    return 0
+    old_for_revert="$new"
+    new_for_revert=""
+  else
+    OLD="$old" NEW="$new" perl -0777 -pe '
+      BEGIN { $o = $ENV{OLD}; $n = $ENV{NEW}; $c = 0 }
+      $c = () = /\Q$o\E/g;
+      die "old text matched $c times, need exactly 1\n" unless $c == 1;
+      s/\Q$o\E/$n/;
+    ' "$playbook" > "$tmp" || { rm -f "$tmp"; echo "REFUSED old text is not unique"; return 1; }
+    old_for_revert="$new"
+    new_for_revert="$old"
   fi
-  OLD="$old" NEW="$new" perl -0777 -pe '
-    BEGIN { $o = $ENV{OLD}; $n = $ENV{NEW}; $c = 0 }
-    $c = () = /\Q$o\E/g;
-    die "old text matched $c times, need exactly 1\n" unless $c == 1;
-    s/\Q$o\E/$n/;
-  ' "$playbook" > "$tmp" || { rm -f "$tmp"; echo "REFUSED old text is not unique"; return 1; }
   mv "$tmp" "$playbook"
-  echo "APPLIED"
+  jq --arg o "$old_for_revert" --arg n "$new_for_revert" \
+    '. + {id: ((.id // "P") + "-revert"), class: "B", old: $o, new: $n}' "$proposal" > "$revert"
+  printf 'APPLIED\nREVERT %s\n' "$revert"
 }
 
 main() {
@@ -299,6 +343,7 @@ main() {
   case "$cmd" in
     state-dir-check) cmd_state_dir_check "$@" ;;
     init)            cmd_init "$@" ;;
+    stop)            cmd_stop "$@" ;;
     liveness)        cmd_liveness "$@" ;;
     plan)            cmd_plan "$@" ;;
     verify-tick)     cmd_verify_tick "$@" ;;

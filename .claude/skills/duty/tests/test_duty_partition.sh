@@ -6,21 +6,28 @@ state="$SANDBOX/state.json"
 "$DUTY" init "$state" "2026-01-04T08:00:00Z"
 "$DUTY" record-action "$state" "3" push "2026-01-04T09:00:00Z"
 "$DUTY" record-action "$state" "9" push "2026-01-03T09:00:00Z"
+"$DUTY" record-action "$state" "42" push "2026-01-04T09:00:00Z"
 
-cat > "$SANDBOX/items.json" <<'EOF'
+K='"assignee_known": true, "comments_known": true, "unresolved_known": true'
+cat > "$SANDBOX/items.json" <<EOF
 [
   {"id": "1", "created": "2026-01-04T09:00:00Z", "assignee_id": "u-me",
-   "unresolved_waiting_on_me": 2},
-  {"id": "2", "created": "2026-01-01T09:00:00Z", "assignee_id": "u-me"},
-  {"id": "3", "created": "2026-01-01T09:00:00Z", "assignee_id": "u-other"},
-  {"id": "4", "created": "2026-01-04T09:00:00Z", "assignee_id": "u-other"},
-  {"id": "5", "created": "2026-01-04T09:00:00Z", "assignee_id": ""},
+   "unresolved_waiting_on_me": 2, $K},
+  {"id": "2", "created": "2026-01-01T09:00:00Z", "assignee_id": "u-me", $K},
+  {"id": "3", "created": "2026-01-01T09:00:00Z", "assignee_id": "u-other", $K},
+  {"id": "4", "created": "2026-01-04T09:00:00Z", "assignee_id": "u-other", $K},
+  {"id": "5", "created": "2026-01-04T09:00:00Z", "assignee_id": "", $K},
   {"id": "6", "created": "2026-01-01T09:00:00Z", "assignee_id": "u-me",
-   "last_comment_at": "2026-01-04T10:00:00Z", "last_comment_author_id": "u-reviewer"},
+   "last_comment_at": "2026-01-04T10:00:00Z", "last_comment_author_id": "u-reviewer", $K},
   {"id": "7", "created": "2026-01-01T09:00:00Z", "assignee_id": "u-me",
-   "last_comment_at": "2026-01-04T10:00:00Z", "last_comment_author_id": "u-me"},
-  {"id": "8", "created": null, "assignee_known": false, "unresolved_known": false},
-  {"id": "9", "created": "2026-01-01T09:00:00Z", "assignee_id": "u-other"}
+   "last_comment_at": "2026-01-04T10:00:00Z", "last_comment_author_id": "u-me", $K},
+  {"id": "8", "created": null, "assignee_known": false, "comments_known": false,
+   "unresolved_known": false},
+  {"id": "9", "created": "2026-01-01T09:00:00Z", "assignee_id": "u-other", $K},
+  {"id": 42, "created": "2026-01-01T09:00:00Z", "assignee_id": "u-other", $K},
+  {"id": "11", "created": "2026-01-01T09:00:00Z", "assignee_id": "u-me"},
+  {"id": "12", "created": "2026-01-04T10:30:00.123+02:00", "assignee_id": "u-me", $K},
+  {"id": "13", "created": "2026-01-04T08:30:00+02:00", "assignee_id": "u-me", $K}
 ]
 EOF
 
@@ -36,14 +43,19 @@ expect_eq "$(get 5 .matched)" '["new_in_scope"]' "new unassigned item is owned"
 expect_eq "$(get 6 .matched)" '["mine_new_comment"]' "comment from someone else is owned"
 expect_eq "$(get 7 .owned)" "false" "your own comment does not pull an item in"
 expect_eq "$(get 8 .unknown)" '["new_in_scope","mine_new_comment","reviewer_waiting"]' \
-  "missing inputs are unknown, not false"
+  "unread inputs are unknown, not false"
 expect_eq "$(get 9 .owned)" "false" "a ledger action before the scope timestamp does not count"
+expect_eq "$(get 42 .matched)" '["acted_this_shift"]' "a numeric id matches a string ledger entry"
+expect_eq "$(get 11 .unknown)" '["new_in_scope","mine_new_comment","reviewer_waiting"]' \
+  "absent known flags are unknown, not false"
+expect_eq "$(get 12 .matched)" '["new_in_scope"]' "offset timestamps with fractions compare by instant"
+expect_eq "$(get 13 .owned)" "false" "an offset timestamp before the scope instant is out of scope"
 
 display="$SANDBOX/display.json"
-echo '[{"id": "10", "created": "2026-01-04T09:00:00Z", "assignee_id": "u-namesake",
-        "assignee_name": "Same Name"}]' > "$display"
-out=$("$DUTY" partition "$display" "$state" "u-me")
-expect_eq "$(printf '%s' "$out" | jq -r '.[0].owned')" "false" "a shared display name is not identity"
+echo "[{\"id\": \"10\", \"created\": \"2026-01-04T09:00:00Z\", \"assignee_id\": \"u-namesake\",
+        \"assignee_name\": \"Same Name\", $K}]" > "$display"
+out2=$("$DUTY" partition "$display" "$state" "u-me")
+expect_eq "$(printf '%s' "$out2" | jq -r '.[0].owned')" "false" "a shared display name is not identity"
 
 reversed="$SANDBOX/reversed.json"
 jq 'reverse' "$SANDBOX/items.json" > "$reversed"
@@ -55,6 +67,8 @@ expect_eq "$("$DUTY" fetch-status 0 28 100)" "COMPLETE" "a short page proves the
 expect_eq "$("$DUTY" fetch-status 0 100 100)" "TRUNCATED" "a full page does not prove the end"
 expect_eq "$("$DUTY" fetch-status 1 0 100)" "UNKNOWN" "a failed fetch is not zero"
 expect_eq "$("$DUTY" fetch-status 0 "" 100)" "UNKNOWN" "an unreadable count is not zero"
+expect_eq "$("$DUTY" fetch-status 0 100 200 100)" "TRUNCATED" "a capped page size is not a short read"
+expect_eq "$("$DUTY" fetch-status 0 99 200 100)" "COMPLETE" "a read below the cap proves the end"
 
 repo="$SANDBOX/repo"
 mkdir -p "$repo" && git -C "$repo" init -q

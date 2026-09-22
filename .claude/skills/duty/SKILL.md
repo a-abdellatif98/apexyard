@@ -107,30 +107,36 @@ Confirm the answers in one block, then start. Ask nothing more until a tick need
 
 1. Read the playbook end to end.
 2. For a new shift, run `"$duty" init "$state"`. For a resume, keep the stored scope timestamp.
-3. Enumerate **every** open item assigned to or authored by `duty.assignee_id`, filtered on the
-   server. Page until `duty.sh fetch-status` prints `COMPLETE`:
+3. Enumerate **every** open item assigned to `duty.assignee_id`, then every open item authored by
+   it, filtered on the server, and union the two sets by id. Run this read once per filter:
 
    ```bash
+   filter="assignee=$(config_get '.duty.assignee_id')"
+   cap=""
+   [ "$(tracker_kind "$repo")" = "glab" ] && cap=100
    limit=100
    while :; do
-     items=$(tracker_list "$repo" state=open assignee="$(config_get '.duty.assignee_id')" limit="$limit")
+     items=$(tracker_list "$repo" state=open "$filter" limit="$limit")
      rc=$?
      n=$(printf '%s' "$items" | jq 'length')
-     status=$("$duty" fetch-status "$rc" "$n" "$limit")
+     status=$("$duty" fetch-status "$rc" "$n" "$limit" "$cap")
      [ "$status" = "TRUNCATED" ] || break
+     [ -n "$cap" ] && [ "$limit" -ge "$cap" ] && break
      limit=$((limit * 2))
    done
    echo "$status $n"
    ```
 
-   On `UNKNOWN`, retry once, then report `UNKNOWN`. Never report zero.
+   The GitLab adapter sends `limit` as `--per-page`, and GitLab caps a page at 100 items. So a
+   `glab` read that returns 100 items stays `TRUNCATED`. Report it as "at least 100", never as a
+   complete count. On `UNKNOWN`, retry once, then report `UNKNOWN`. Never report zero.
 4. Run one tick.
 5. Report a baseline: each owned item against the done checks, the backlog count, and every open
    and parked escalation.
-6. Start the timer:
+6. Start the timer at `duty.watcher_interval_minutes` (default 15):
 
    ```
-   /loop 15m /duty tick
+   /loop <watcher_interval_minutes>m /duty tick
    ```
 
    The timer belongs to this session. If the session ends, the loop stops silently. The liveness
@@ -142,21 +148,21 @@ Confirm the answers in one block, then start. Ask nothing more until a tick need
 Follow playbook section 3. `duty.sh plan` prints the steps for this tick:
 
 ```bash
+tick="$state_dir/ticks/$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$(dirname "$tick")"
 "$duty" liveness "$state"
-"$duty" plan "$state"
+"$duty" plan "$state" > "$tick.plan"
 ```
 
-Record each step in a tick log as you finish it, then check the log:
+Record each step in a tick log as you finish it, then check the log against the plan:
 
 ```bash
-log="$state_dir/ticks/$(date -u +%Y%m%dT%H%M%SZ).log"
-mkdir -p "$(dirname "$log")"
-printf '%s\n' liveness >> "$log"
+printf '%s\n' liveness >> "$tick.log"
 # ... watcher pass ...
-printf '%s\n' watcher >> "$log"
-"$duty" stamp "$state" watcher && printf '%s\n' stamp_watcher >> "$log"
-# ... review pass only when plan printed review ...
-"$duty" verify-tick "$log"
+printf '%s\n' watcher >> "$tick.log"
+"$duty" stamp "$state" watcher && printf '%s\n' stamp_watcher >> "$tick.log"
+# ... review pass only when the plan lists review ...
+"$duty" verify-tick "$tick.log" "$tick.plan"
 ```
 
 If `verify-tick` prints `FAILED`, say so in the report and journal it.
@@ -165,18 +171,21 @@ If `verify-tick` prints `FAILED`, say so in the report and journal it.
 functions return `number`, `title`, `url`, `labels`, `state`, and `updatedAt` only. They do not
 return the creation time, comments, or review threads. Read those fields with a read-only call to
 the CLI that `tracker_kind` names. Never write through that CLI. When a field cannot be read, set
-its `*_known` flag to `false`. Build one JSON array with these fields per item, then run the
-partition:
+its `*_known` flag to `false`. For a `custom` or `none` tracker, set every `*_known` flag to
+`false`. Build one JSON array with these fields per item, then run the partition:
 
 | Field | Meaning |
 |---|---|
-| `id` | tracker id |
-| `created` | ISO-8601 creation time, UTC |
-| `assignee_id` | assignee id, empty when unassigned |
-| `assignee_known` | `false` when the assignee could not be read |
-| `last_comment_at`, `last_comment_author_id` | latest comment, when known |
+| `id` | tracker id, string or number |
+| `created` | ISO-8601 creation time |
+| `assignee_id` | assignee id or login, empty when unassigned |
+| `assignee_known` | `true` only when the assignee was read |
+| `last_comment_at`, `last_comment_author_id` | latest comment |
+| `comments_known` | `true` only when the comments were read |
 | `unresolved_waiting_on_me` | count of unresolved threads whose last note is not yours |
-| `unresolved_known` | `false` when the threads could not be read |
+| `unresolved_known` | `true` only when the threads were read |
+
+A missing `*_known` flag counts as not read. The condition that depends on it is `unknown`.
 
 ```bash
 "$duty" partition "$items_file" "$state" "$(config_get '.duty.assignee_id')"
@@ -212,8 +221,9 @@ For each proposal:
 "$duty" classify "$proposal_file" "$playbook"
 ```
 
-- `A` with no reasons: apply it with `"$duty" apply "$proposal_file" "$playbook"`, mark it
-  `applied`, and record the revert path.
+- `A` with no reasons: apply it with `"$duty" apply "$proposal_file" "$playbook"` and mark it
+  `applied`. `apply` prints `REVERT <path>`. Record that path. The revert proposal is class B, so
+  `revert <id>` applies it with `--operator-approved`.
 - `B`: mark it `proposed`, change nothing, and list the reasons. A reason that starts with `RAIL`
   goes in the rail group of the weekly report and names the protection it would weaken.
 
@@ -229,8 +239,9 @@ The handover block lists owned items against the done checks, items waiting on s
 team, held work with the command or decision that releases it, and every open and parked
 escalation from `duty.sh handover-items`.
 
-On `stop`, write the handover, then clear `shift.scope_timestamp`. A session that ends without
-`stop` keeps the timestamp, so the next session resumes the same shift.
+On `stop`, write the handover, then run `"$duty" stop "$state"`. It archives the state file under
+`archive/` and removes it, so the next shift starts with `init`. A session that ends without
+`stop` keeps the state file, so the next session resumes the same shift.
 
 ---
 

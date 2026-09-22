@@ -21,19 +21,22 @@ The model that drafts a proposal also labels it. A rule written only in prose re
 
 ## Decision
 
-Chosen: **classify by effect in `duty.sh`**, because it is the strongest control that stays inside the skill. The classifier ignores the declared class unless it is B. It returns class B when a proposal does any of these:
+Chosen: **classify by effect in `duty.sh`, with an allowlist for class A**, because it is the strongest control that stays inside the skill. The classifier ignores the declared class unless it is B. Class A is possible only in a section that carries the `duty:class-a` marker. The bundled playbook gives that marker to the trap log only. The classifier returns class B when a proposal does any of these:
 
-- edits or appends to a section that carries the `duty:protected` marker;
-- removes or rewrites a line with normative words such as never, always, must, only, gate, or escalate;
-- changes any number;
-- adds text that widens unattended action or calls a check redundant;
-- targets text or a section that the helper cannot find.
+- targets a section without the `duty:class-a` marker, or text it cannot find
+- adds a heading or a section marker
+- adds a normative word, such as never, must, only, except, or instead
+- removes or rewrites a normative line
+- changes any number
+- names a gated action, such as merge, approve, force, push, or deploy, or widens unattended action
+
+A first version used a denylist of protected sections. Review found three proposals that passed it as class A: an append that named a gated action, an append that added a new unprotected heading, and an exception line added beside an unchanged rule. The allowlist and the new-text checks close all three. Each has a regression test.
 
 `duty.sh apply` refuses a class B proposal unless the call passes `--operator-approved`. The skill allows that flag only when the operator typed `approve <id>` in the current message.
 
 ## Consequences
 
-- Some harmless corrections become class B, for example a corrected number in an evidence line. This error direction is the intended one.
+- Most corrections become class B, including a factual correction outside the trap log and a corrected number in an evidence line. This error direction is the intended one. Class A covers new trap entries and wording fixes in the trap log.
 - The rail is not a security boundary against an agent that edits `playbook.md` directly with a file tool. The helper and the tests make a violation visible and reviewable. They do not make it impossible.
 - The protected-section marker is itself in the playbook. A proposal that removes a marker edits a protected section, so it is class B.
 - The skill adds no hook and does not change `.claude/settings.json`.

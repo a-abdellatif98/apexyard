@@ -63,4 +63,20 @@ expect_eq "$out" "STALE watcher 120" "a field nothing reads cannot mask a stale 
 expect_eq "$(jq -r '.actions[0].item + ":" + .actions[0].action' "$state")" "42:push" \
   "actions are recorded in the ledger"
 
+printf '%s\n' liveness watcher stamp_watcher review stamp_review report journal > "$SANDBOX/plan"
+printf '%s\n' liveness watcher stamp_watcher report journal > "$SANDBOX/noreview.log"
+out=$("$DUTY" verify-tick "$SANDBOX/noreview.log" "$SANDBOX/plan"); rc=$?
+expect_eq "$rc" "1" "a tick that skipped a planned review fails"
+expect_contains "$out" "planned review pass skipped" "failure names the skipped review"
+expect_eq "$("$DUTY" verify-tick "$log" "$SANDBOX/plan")" "OK" "a tick that ran its plan verifies"
+
+archived=$("$DUTY" stop "$state" "2026-01-08T17:00:00Z")
+expect_eq "$([ -f "$state" ] && echo present || echo gone)" "gone" "stop removes the live state file"
+expect_eq "$(jq -r .shift.stopped "$archived")" "2026-01-08T17:00:00Z" "stop archives the shift"
+"$DUTY" init "$state" "2026-01-11T08:00:00Z"
+expect_eq "$(jq -r .shift.scope_timestamp "$state")" "2026-01-11T08:00:00Z" "a new shift starts after stop"
+
+"$DUTY" init "$state" "2026-01-12T08:00:00Z" 2>/dev/null; rc=$?
+expect_eq "$rc" "2" "init refuses to overwrite a live shift"
+
 finish test_duty_tick
