@@ -30,6 +30,8 @@ Defaults match today's single-fork layout (`./apexyard.projects.yaml`, `./projec
 The **issue** sources below call `tracker_list` from `_lib-tracker.sh` (per `repo:` from the registry) instead of hardcoding `gh issue list`, so `/tasks` works on GitLab-tracked projects too:
 
 ```bash
+# After every call, read TRACKER_LIST_STATUS (#1441): COMPLETE, TRUNCATED, or UNKNOWN.
+# TRUNCATED → read again with a higher limit. UNKNOWN → report unknown, never 0.
 # tracker_list <owner/repo> [state=…] [assignee=@me|none|<user>] [author=…] [labels=csv] [search=…] [since=ISO] [limit=N]
 # → JSON array [{ref,number,state,title,url,labels,updatedAt}, …]  ([] on empty/unavailable)
 ```

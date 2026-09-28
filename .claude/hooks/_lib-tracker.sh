@@ -1086,10 +1086,42 @@ _tracker_normalise_list_custom() {
   printf '%s' "$raw" | jq -c "$jq_expr" 2>/dev/null
 }
 
+# Public: tracker_page_cap <owner/repo>
+#   Echoes the adapter's maximum page size, or 0 when the adapter has none.
+#   GitLab caps a page at 100 whatever --per-page asks for, so a 100-item glab
+#   result never proves the end of the set.
+tracker_page_cap() {
+  case "$(tracker_issue_kind "${1:-}")" in
+    glab) printf '100\n' ;;
+    *)    printf '0\n' ;;
+  esac
+}
+
+# Public: tracker_fetch_status <rc> <count> <limit> [owner/repo]
+#   COMPLETE  — the read returned fewer items than the effective limit, which
+#               is the only proof that it reached the end of the set.
+#   TRUNCATED — the read filled the limit (or the adapter's page cap). More
+#               items may exist. Raise the limit and read again.
+#   UNKNOWN   — the call failed or the count is unreadable. Never report this
+#               as zero: a failed fetch is not an empty result.
+tracker_fetch_status() {
+  local rc="${1:-1}" count="${2:-}" limit="${3:-0}" repo="${4:-}" cap effective
+  if [ "$rc" != "0" ]; then printf 'UNKNOWN\n'; return 0; fi
+  case "$count" in ''|*[!0-9]*) printf 'UNKNOWN\n'; return 0 ;; esac
+  case "$limit" in ''|*[!0-9]*) printf 'UNKNOWN\n'; return 0 ;; esac
+  effective="$limit"
+  cap=$(tracker_page_cap "$repo")
+  if [ "$cap" -gt 0 ] && [ "$cap" -lt "$effective" ]; then effective="$cap"; fi
+  if [ "$effective" -le 0 ]; then printf 'UNKNOWN\n'; return 0; fi
+  if [ "$count" -lt "$effective" ]; then printf 'COMPLETE\n'; else printf 'TRUNCATED\n'; fi
+}
+
 # Public: tracker_list <owner/repo> [key=value ...]
+#   Sets TRACKER_LIST_STATUS to this call's tracker_fetch_status verdict.
 tracker_list() {
   local repo="$1"
   shift 2>/dev/null || true
+  TRACKER_LIST_STATUS="UNKNOWN"
   if [ -z "$repo" ]; then
     printf '[]\n'
     return 1
@@ -1116,6 +1148,7 @@ tracker_list() {
     esac
   done
 
+
   # Per-project resolution: the target repo selects the project's tracker
   # override, else the global block (never cwd, never a session marker).
   local kind
@@ -1124,6 +1157,21 @@ tracker_list() {
     none)
       printf '[]\n'
       return 1
+      ;;
+  esac
+
+  # Pass an explicit limit even when the caller gave none. gh and glab each
+  # apply their own default (30) otherwise, and a caller cannot compute
+  # completeness against a limit it never chose. This runs after the kind
+  # resolution above, never before: loading the config lib first would warm
+  # the resolution cache from a different context and change dispatch.
+  case "$f_limit" in
+    ''|*[!0-9]*)
+      f_limit=""
+      if command -v config_get_or >/dev/null 2>&1; then
+        f_limit=$(config_get_or '.tracker.list_default_limit' '30')
+      fi
+      case "$f_limit" in ''|*[!0-9]*) f_limit=30 ;; esac
       ;;
   esac
 
@@ -1161,6 +1209,15 @@ tracker_list() {
       'map(select((.updatedAt // "") == "" or (.updatedAt >= $since)))' 2>/dev/null)
     [ -z "$normalised" ] && normalised='[]'
   fi
+
+  # Completeness is judged on the server-returned count, before the
+  # client-side `since` filter above drops any rows. A filtered-down array
+  # would otherwise read as COMPLETE while the server page was full.
+  local served
+  served=$(printf '%s' "$raw" | jq -r 'if type == "array" then length else empty end' 2>/dev/null)
+  [ -n "$served" ] || served=$(printf '%s' "$normalised" | jq -r 'length' 2>/dev/null)
+  # shellcheck disable=SC2034  # read by callers (/inbox, /tasks), not in this file
+  TRACKER_LIST_STATUS=$(tracker_fetch_status 0 "$served" "$f_limit" "$repo")
 
   printf '%s\n' "$normalised"
   return 0

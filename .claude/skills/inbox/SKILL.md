@@ -35,6 +35,22 @@ The **issue** sections below (assigned to you, your issues with new comments, bl
 tracker_list "$repo" state=open assignee=@me limit=50 2>/dev/null
 ```
 
+**Check that each read was complete (#1441).** `tracker_list` prints `[]` and returns non-zero on
+failure, and a result that fills the limit may be a short read. After every call, read
+`TRACKER_LIST_STATUS`:
+
+```bash
+items=$(tracker_list "$repo" state=open assignee=@me limit=50 2>/dev/null)
+case "$TRACKER_LIST_STATUS" in
+  TRUNCATED) items=$(tracker_list "$repo" state=open assignee=@me limit=200 2>/dev/null) ;;
+  UNKNOWN)   echo "$repo: could not read issues" ;;   # never print 0
+esac
+```
+
+On `UNKNOWN`, say the count is unknown for that project. Do not fold it into a zero. On a
+`TRUNCATED` result that stays truncated at the higher limit, report the count as "at least N".
+GitLab caps a page at 100, so a `glab` project stops there.
+
 > **Scope caveat (forge axis, #711).** The **PR** sections still call `gh pr list` directly. The PR/MR forge abstraction is a separate ticket (#711); until it lands, `/inbox`'s PR sections are GitHub-only. `/inbox` is therefore *issue-axis* tracker-agnostic, not fully tracker-agnostic. Filters GitHub expresses but GitLab can't (`mentions:`, `commenter:`) stay on a gh-only path, documented at the section that uses them.
 
 ## Usage
