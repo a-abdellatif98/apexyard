@@ -30,11 +30,26 @@ Defaults match today's single-fork layout (`./apexyard.projects.yaml`, `./projec
 The **issue** sources below call `tracker_list` from `_lib-tracker.sh` (per `repo:` from the registry) instead of hardcoding `gh issue list`, so `/tasks` works on GitLab-tracked projects too:
 
 ```bash
-# After every call, read TRACKER_LIST_STATUS (#1441): COMPLETE, TRUNCATED, or UNKNOWN.
-# TRUNCATED → read again with a higher limit. UNKNOWN → report unknown, never 0.
 # tracker_list <owner/repo> [state=…] [assignee=@me|none|<user>] [author=…] [labels=csv] [search=…] [since=ISO] [limit=N]
 # → JSON array [{ref,number,state,title,url,labels,updatedAt}, …]  ([] on empty/unavailable)
 ```
+
+**Check that each read was complete (#1441).** A call that fills its limit may be a short read, and
+a failed call prints `[]`. Use `tracker_list_to`, which returns the verdict on stdout:
+
+```bash
+tmp=$(mktemp)
+status=$(tracker_list_to "$tmp" "$repo" assignee=@me labels=priority-high 2>/dev/null)
+case "$status" in
+  UNKNOWN)   echo "$repo: could not read issues" ;;   # never print 0
+  TRUNCATED) echo "$repo: showing the first $(jq -r 'length' < "$tmp")" ;;
+esac
+```
+
+Do not write `items=$(tracker_list …)` and then read `TRACKER_LIST_STATUS`. A subshell cannot pass
+that variable back, so you would read a stale verdict from an earlier project. The rows in the
+table below that pass no `limit` take the configured default (`tracker.list_default_limit`, 30), so
+they are the ones most likely to come back `TRUNCATED`.
 
 > **Scope caveat (forge axis, #711).** The **PR** sources still call `gh pr list` / `gh api …/pulls`. The PR/MR forge abstraction is #711; until it lands, those sources are GitHub-only, so `/tasks` is *issue-axis* tracker-agnostic, not fully tracker-agnostic. Filters GitHub expresses but GitLab can't (`mentions:`, `commenter:`, `assignee=none` on glab) degrade to a gh-only path or empty, noted per source.
 
