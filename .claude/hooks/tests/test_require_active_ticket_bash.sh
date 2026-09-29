@@ -24,6 +24,10 @@ LIB_ACTIVE_TICKET="$SRC_ROOT/.claude/hooks/_lib-active-ticket.sh"
 LIB_MASK="$SRC_ROOT/.claude/hooks/_lib-mask-quoted.sh"
 DEFAULTS="$SRC_ROOT/.claude/project-config.defaults.json"
 
+# This legacy fixture omits _lib-command-scrub.sh on purpose. It pins the
+# raw-command fallback when a partial install lacks the shared parser. The
+# installed-parser verdicts live in test_command_scrub_regressions.sh.
+
 for f in "$HOOK_SRC" "$LIB_BASH" "$LIB_CFG" "$LIB_PATH_RESOLVE" "$LIB_ACTIVE_TICKET" "$LIB_MASK" "$DEFAULTS"; do
   if [ ! -f "$f" ]; then
     echo "FAIL: required source missing: $f" >&2
@@ -263,15 +267,25 @@ run_case "per-worktree via git linked-worktree detection (no env var)" 0 "" "$in
 # These cases prove the over-blocking described in #569 is gone, while
 # preserving the gate for writes into tracked source paths.
 
-# 17. cat > /tmp/x with no ticket → allowed (absolute path outside repo)
+# 17. cat > /tmp/x with no ticket → allowed outside repo, including on macOS
+#     where /tmp is a system symlink.
 sb=$(make_sandbox)
+physical_tmp=$(cd /tmp && pwd -P)
 in=$(jq -nc --arg c "cat > /tmp/commit-msg.txt" '{tool_name:"Bash", tool_input:{command:$c}}')
 run_case "bash redirect to /tmp exempt (no ticket needed)" 0 "" "$in" "$sb"
-
-# 18. echo > /var/tmp/scratch with no ticket → allowed (non-repo absolute path)
 sb=$(make_sandbox)
+in=$(jq -nc --arg c "cat > $physical_tmp/commit-msg.txt" '{tool_name:"Bash", tool_input:{command:$c}}')
+run_case "bash redirect to physical /tmp exempt" 0 "" "$in" "$sb"
+
+# 18. echo > /var/tmp/scratch with no ticket → allowed on systems where
+#     /var is a symlink, and with the physical spelling of that path.
+sb=$(make_sandbox)
+physical_var_tmp=$(cd /var/tmp && pwd -P)
 in=$(jq -nc --arg c "echo hello > /var/tmp/scratch.txt" '{tool_name:"Bash", tool_input:{command:$c}}')
 run_case "bash redirect to /var/tmp exempt" 0 "" "$in" "$sb"
+sb=$(make_sandbox)
+in=$(jq -nc --arg c "echo hello > $physical_var_tmp/scratch.txt" '{tool_name:"Bash", tool_input:{command:$c}}')
+run_case "bash redirect to physical /var/tmp exempt" 0 "" "$in" "$sb"
 
 # 19. echo > .claude/session/foo with no ticket → allowed (exempt .claude/ path)
 sb=$(make_sandbox)
@@ -516,6 +530,7 @@ fi
 #     #883 repro.
 sb=$(make_sandbox)
 home_sim=$(mktemp -d)
+home_sim=$(cd "$home_sim" && pwd -P)
 in=$(jq -nc --arg p "$home_sim/.zshrc" '{tool_name:"Edit", tool_input:{file_path:$p}}')
 run_case "#883 Edit-tool write to out-of-repo dotfile exempt (no ticket)" 0 "" "$in" "$sb"
 rm -rf "$home_sim"
@@ -523,6 +538,7 @@ rm -rf "$home_sim"
 # 32. Same but MultiEdit tool shape (file_path key) → EXEMPT.
 sb=$(make_sandbox)
 home_sim=$(mktemp -d)
+home_sim=$(cd "$home_sim" && pwd -P)
 in=$(jq -nc --arg p "$home_sim/.bashrc" '{tool_name:"MultiEdit", tool_input:{file_path:$p}}')
 run_case "#883 MultiEdit-tool write to out-of-repo dotfile exempt" 0 "" "$in" "$sb"
 rm -rf "$home_sim"
@@ -535,6 +551,7 @@ rm -rf "$home_sim"
 #     resolvable.
 sb=$(make_sandbox)
 home_sim=$(mktemp -d)
+home_sim=$(cd "$home_sim" && pwd -P)
 in=$(jq -nc --arg c "echo 'export X=1' >> .zshrc" '{tool_name:"Bash", tool_input:{command:$c}}')
 run_case_cwd "#883 bash relative write from out-of-repo CWD exempt" 0 "" "$in" "$sb" "$home_sim"
 rm -rf "$home_sim"
@@ -671,7 +688,7 @@ run_case "#886 multi-target (out-of-repo then in-repo) allowed WITH ticket" 0 ""
 #     exempt — the per-target loop must not become stricter than before
 #     for the plain single-target case.
 sb=$(make_sandbox)
-in=$(jq -nc --arg c "echo a > /tmp/x" '{tool_name:"Bash", tool_input:{command:$c}}')
+in=$(jq -nc --arg c "echo a > $physical_tmp/x" '{tool_name:"Bash", tool_input:{command:$c}}')
 run_case "#886 regression: single out-of-repo target still exempt" 0 "" "$in" "$sb"
 
 # 44. Regression: a SINGLE in-repo target (no other target) remains gated
@@ -864,9 +881,9 @@ for c in "awk -i inplace 1 src/app.ts; sed -n 'w /tmp/x' in.txt" \
   run_case "#1414 w decoy beside an unextracted write blocked w/o ticket: $c" 2 "BLOCKED" "$in" "$sb"
 done
 
-# rm alone is exempt, and a `w` to /tmp beside it stays exempt. An escaped
+# rm alone is exempt, and a `w` to physical /tmp beside it stays exempt. An escaped
 # quote after an fd copy stays a read.
-for c in "rm -f old.ts; sed -n 'w /tmp/x' in.txt" 'bash -c "sh -c \"make 2>&1\""'; do
+for c in "rm -f old.ts; sed -n 'w $physical_tmp/x' in.txt" 'bash -c "sh -c \"make 2>&1\""'; do
   sb=$(make_sandbox)
   in=$(jq -nc --arg c "$c" '{tool_name:"Bash", tool_input:{command:$c}}')
   run_case "#1414 sanity: stays ungated: $c" 0 "" "$in" "$sb"
@@ -992,10 +1009,9 @@ run_case "#886 sanity: '||' then '>&2' fd-dup is not gated" 0 "" "$in" "$sb"
 # --- Quoted-origin diagnostic (#1356) ----------------------------------
 #
 # The gate verdict does NOT change. A read-only command whose only `>` sits
-# inside a quoted argument still blocks, because AgDR-0113 forbids feeding
-# quote-filtered text to the presence question. What changes is the message.
-# When every write sign the detector found sits inside quotes, a note says
-# so, and states both readings. See _lib-mask-quoted.sh and AgDR-0171.
+# inside a quoted argument still blocks in this parser-missing fixture. The
+# diagnostic note explains the conservative fallback. The installed parser
+# allows these read-only commands; test_command_scrub_regressions.sh pins it.
 #
 # This section sits before the #1089 section on purpose. Other open PRs append
 # their cases at the end of the file, and a separate spot keeps merges clean.
@@ -1029,9 +1045,8 @@ quoted_note_case() {
 
 bash_input() { jq -nc --arg c "$1" '{tool_name:"Bash", tool_input:{command:$c}}'; }
 
-# A. The maintainer's must-pass cases on #1356. This PR does NOT make them
-# pass. Each one still blocks. The note now explains all four, including the
-# one whose target the detector cannot extract.
+# A. Parser-missing fallback: each quoted redirect still blocks and carries
+# the diagnostic note, including the case with no extractable target.
 quoted_note_case "#1356 current behaviour: grep -E '^>' blocks, with the note" \
   note "$(bash_input "grep -E '^>' f")"
 quoted_note_case "#1356 current behaviour: grep -E 'a>b' blocks, with the note" \
@@ -1244,6 +1259,37 @@ EOF
 in=$(jq -nc --arg c 'sed -i "s/x/y/" "$VAR"' \
   '{tool_name:"Bash", tool_input:{command:$c}}')
 run_case "#1396 reported repro: sed -i on a variable path honors active ticket" 0 "" "$in" "$sb"
+
+# --- #1480: git log/diff --output, sort -o, yq -i, python3 -Bc -------------
+#
+# Each form exited 0 with no ticket on dev. The detector must block without
+# a ticket and allow with one. Ordinary neighbours stay ungated.
+
+for c in 'git log --output=src/app.ts' 'git log --output src/app.ts' \
+         'git diff --output=src/app.ts' 'git diff --output src/app.ts' \
+         'sort -o src/app.ts input.txt' 'yq -i ".a=1" src/app.ts' \
+         "python3 -Bc \"open('src/app.ts','w').write('x')\"" \
+         "python3 -W ignore -c \"open('src/app.ts','w').write('x')\""; do
+  sb=$(make_sandbox)
+  in=$(jq -nc --arg c "$c" '{tool_name:"Bash", tool_input:{command:$c}}')
+  run_case "#1480 blocked w/o ticket: $c" 2 "BLOCKED" "$in" "$sb"
+
+  sb=$(make_sandbox)
+  cat > "$sb/.claude/session/current-ticket" <<EOF
+repo=me2resh/apexyard
+number=1480
+title=write detector gaps
+EOF
+  run_case "#1480 allowed WITH ticket: $c" 0 "" "$in" "$sb"
+done
+
+# This fixture omits _lib-command-scrub.sh, so a quoted '>' still reads as a
+# redirect here. test_command_scrub_regressions.sh covers the quoted case.
+for c in "git log --oneline -1" "sort src/app.ts" 'yq ".a" src/app.ts'; do
+  sb=$(make_sandbox)
+  in=$(jq -nc --arg c "$c" '{tool_name:"Bash", tool_input:{command:$c}}')
+  run_case "#1480 sanity: read stays ungated: $c" 0 "" "$in" "$sb"
+done
 
 # --- Summary -----------------------------------------------------------
 

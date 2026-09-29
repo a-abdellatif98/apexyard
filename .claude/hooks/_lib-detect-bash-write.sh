@@ -1,5 +1,28 @@
 #!/bin/bash
 # _lib-detect-bash-write.sh — detect whether a Bash command writes to a file.
+
+_bdw_lib_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if [ -r "$_bdw_lib_dir/_lib-command-scrub.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$_bdw_lib_dir/_lib-command-scrub.sh"
+fi
+unset _bdw_lib_dir
+
+_bdw_syntax() {
+  if declare -F scrub_bash_command >/dev/null 2>&1; then
+    scrub_bash_command "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+_bdw_operators() {
+  if declare -F mask_bash_command_operators >/dev/null 2>&1; then
+    mask_bash_command_operators "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
 #
 # Closes the bypass surface where Bash file-writes routed around hooks
 # scoped to Edit|Write|MultiEdit only. See me2resh/apexyard#151.
@@ -85,8 +108,15 @@
 #     - curl -o / --output
 #     - wget -O / --output-document
 #
+#   Tool output / in-place writers (#1480)
+#     - git log|diff --output / --output=
+#     - sort -o / -uo / -oFILE / --output
+#     - yq -i / -Pi / --inplace
+#
 #   Embedded interpreters with inline source (-c / -e / -r)
-#     - python -c '…' with write/open/touch/copy/rename keywords
+#     - python -c / -Bc '…' with write/open/touch/copy/rename keywords
+#       (also conservatively gates -cB, which Python reads as -c with
+#       program text B — not as -c plus a bundled B flag)
 #     - python <<EOF / python - <<EOF (heredoc-fed)
 #     - node -e '…' with writeFile/appendFile/write keywords
 #     - node <<EOF (heredoc-fed, #153)
@@ -249,7 +279,9 @@ _bdw_starts_with_git_subcommand() {
 # extractor, and the per-segment extractor) read these two constants. The
 # pattern used to be copied into each function. #886/#926 round 5 showed
 # that copies drift apart, and a drift is a bypass.
-_BDW_REDIRECT_RE='(&>>?|(^|[^|<&])>>?\|?|[0-9]*<>)[[:space:]]*[^[:space:]&|;(][^[:space:]&|;]*|(^|[^|<&>])>&[[:space:]]*['"'"'"]?[0-9]*[^0-9[:space:]&|;()<>'"'"'"`\-][^[:space:]&|;]*'
+_BDW_REDIRECT_RE='(&>>?|>>?\|?|[0-9]*<>)[[:space:]]*[^[:space:]&|;(<>][^[:space:]&|;<>]*|(^|[^|<&>])>&[[:space:]]*['"'"'"]?[0-9]*[^0-9[:space:]&|;()<>'"'"'"`\-][^[:space:]&|;<>]*'
+# The ordinary > form has no leading-context byte: grep -o cannot reuse the
+# final byte of a previous target in `>/tmp/x>src/app.ts` (#1439).
 # Strips the operator from a matched redirect, leaving the target. `[^>]*`
 # swallows a leading fd digit, `&`, or `<`. The group then removes the rest
 # of the operator: a second `>`, a `|`, or the `&` of `>&`.
@@ -522,19 +554,174 @@ _bdw_match_wget_output() {
   return 1
 }
 
+# 8b. git log|diff --output / --output= (#1480).
+#     git archive -o is gated elsewhere. Only log and diff are named here.
+#     Avoid --output-directory and other --output-* long options by requiring
+#     `--output` to end the flag token before `=` or whitespace.
+_bdw_match_git_log_diff_output() {
+  local cmd="$1"
+  echo "$cmd" | grep -qE '\bgit[[:space:]]' || return 1
+  echo "$cmd" | grep -qE '\bgit[[:space:]]+([^|;&]*[[:space:]])?(log|diff)[[:space:]][^|;&]*--output(=|[[:space:]]|$)'
+}
+
+# 8c. sort -o FILE / sort --output=FILE (#1480).
+#     GNU and BSD sort write the result to -o/--output. Also catch `sort -uo`
+#     (o bundled with other shorts) and `sort -oFILE` (attached argument).
+#     Do not match a bare `-o` glued into an unrelated long option: require a
+#     following path token, an attached path, or an equals form. `sort -u file`
+#     stays a read. `sort` must be a command word, so the `--sort` option of
+#     another tool (`ps --sort -rss -o pid`) stays a read.
+_bdw_match_sort_output() {
+  local cmd="$1"
+  echo "$cmd" | grep -qE '\bsort\b' || return 1
+  echo "$cmd" | grep -qE '(^|[^-[:alnum:]_.])sort[[:space:]][^|;&]*(-[A-Za-z0-9]*o[A-Za-z0-9]*[[:space:]]+|-o[^[:space:]=][^[:space:]]*|--output(=|[[:space:]]+))'
+}
+
+# 8d. yq -i / yq --inplace (#1480).
+#     In-place edit of a YAML/JSON file. Same role as sed -i / awk -i inplace.
+#     Also catch `yq -Pi` / `yq -iP` (i bundled with other shorts). The short
+#     flag must be its own token so `yq '.a' my-i.yaml` and `yq -P '.a' file`
+#     stay reads.
+_bdw_match_yq_inplace() {
+  local cmd="$1"
+  echo "$cmd" | grep -qE '\byq\b' || return 1
+  echo "$cmd" | grep -qE '\byq[[:space:]]+([^|;&]*[[:space:]])?(-[A-Za-z0-9]*i[A-Za-z0-9]*\b|--inplace\b)'
+}
+
+# Python write-keyword set, shared by the -c and heredoc matchers below.
+#
+# The `open(` clause matches a quoted MODE token after a comma (#1372). The
+# earlier form `open\([^)]*[wa+]` accepted a w / a / + anywhere inside the
+# parentheses, so it matched the FILENAME: `open('data.txt')` and
+# `open('.claude/x.json')` were read as writes, while `open('b.yml')` was not —
+# the verdict depended on which letters the path happened to contain.
+#
+# Matching a quoted run of mode characters instead means a path cannot be
+# mistaken for a mode: `'data.txt'` contains `.` and so is not a mode token,
+# while `'w'`, `'wb'`, `'x'` and `'r+'` are. `[^)]*` was rejected because it
+# cannot cross a nested `)`, which would have missed `open(str(p), 'w')` —
+# a form `dev` misses too. `dev` catches the `os.path.join(...)` and
+# `pathlib.Path(...)` shapes only by accident, via the `a` in "path"/"Path",
+# so that coverage disappears the moment the variable is renamed.
+#
+# The mode class also gains `x` (exclusive creation), which the previous form
+# missed entirely.
+#
+# `pathlib.Path(p).open('w')` needs its own clause. `Path.open()` takes the
+# MODE as its first positional argument, so the comma the builtin clause
+# requires never appears — `Path('f').open('w')` truncates a real file and
+# would otherwise read as a read. The `\.open\(` form is matched directly
+# against a mode token. A bare `.open()` or `.open('r')` stays a read.
+#
+# `open(*args)` is treated as a write: the mode is unknowable from the call
+# site, and this clause exists to gate writes.
+#
+# A mode held in a VARIABLE (`open(path, mode)`) is matched by its own clause:
+# a second argument that is a bare identifier — no quotes, no `=` — could be
+# any mode, so it is treated as a write. `dev` caught these only because a
+# realistic identifier like `path` contains an `a`; that is an accident, and
+# the accident disappears the moment the variable is renamed.
+#
+# `os.open()` takes integer flags rather than a mode string, so it needs its
+# own clause keyed on the write flags.
+#
+# The leading `.*` is intentionally greedy: over-matching this clause only
+# costs an unnecessary ticket check.
+#
+# The optional `\\?` before each quote absorbs a backslash-escaped quote. A
+# command can reach a hook still carrying its escapes — `python3 -c
+# "open(\"f\", \"w\")"` — so the mode token is delimited by `\"`, not `"`.
+# The optional `([:|]...)` tail carries tarfile's compression suffixes —
+# `'w:gz'`, `'w|bz2'`, `'x:xz'`. Those are write modes whose `:` or `|` would
+# otherwise terminate the token early and read as a read. `'r:gz'` stays a
+# read, because the leading `[wax+]` still has to match.
+_BDW_PY_MODE="\\\\?['\"][rbtU]*[wax+][rwxabt+U]*([:|][a-z0-9*]*)?\\\\?['\"]"
+
+# python -c presence (#1480 + review fix).
+#
+# Legacy (dev) form: `(-[^c]*[[:space:]]+)?-c\b` after python. `[^c]*` may span
+# spaces, so an option argument such as `ignore` in `python3 -W ignore -c`
+# still reaches `-c`. Keep this form so the new detector is never looser than
+# dev for any input.
+_BDW_PYTHON_DASH_C_LEGACY_RE='\bpython3?[[:space:]]+(-[^c]*[[:space:]]+)?-c\b'
+
+# Bundled shorts (#1480): a lone `-c`, bundled shorts that include `c` (`-Bc`),
+# and preceding short flags that do not contain `c` (`-B -c`, `-OO -c`). Each
+# skipped token must start with `-`, so this form alone misses
+# `python3 -W ignore -c`. Long options such as `--check` do not match: a
+# second leading dash fails the short-option class.
+#
+# `-cB` is also matched here. Python reads that as `-c` with program text `B`
+# (not as `-c` plus a bundled `B` flag). Detection stays conservative and
+# continues to gate it.
+_BDW_PYTHON_DASH_C_BUNDLED_RE='\bpython3?[[:space:]]+(-[^c[:space:]]*[[:space:]]+)*-[A-Za-z0-9]*c[A-Za-z0-9]*\b'
+
+# Match when EITHER form matches. Apply at every presence check.
+_BDW_PYTHON_DASH_C_RE="(${_BDW_PYTHON_DASH_C_LEGACY_RE}|${_BDW_PYTHON_DASH_C_BUNDLED_RE})"
+
+# A call whose arguments after the first comma contain NO quote at all has no
+# literal mode to read, so the mode is unknown and the call counts as a write.
+# That covers a mode in a variable, in a keyword, or behind an attribute or a
+# method call — `open(p, m)`, `open(p, mode=m)`, `open(p, self.mode)`,
+# `open(p, mode.lower())`. A call with a quoted argument is left to the mode
+# clause above, so `open(p, encoding='utf-8')` stays a read.
+#
+# `.*` rather than `[^,)]*` for the first argument: the latter cannot cross a
+# nested `)`, so `open(str(path), mode)` and `open(os.path.join(d,'f'), m)`
+# escaped it. Both are ordinary shapes, and both were caught on `dev` only by
+# the letter `a` in `path` or `args`. That accident is not coverage.
+# `os.open` is deliberately excluded here — its flags are integers and never
+# quoted, so this clause would match every call including a read-only
+# `os.open(p, os.O_RDONLY)`. That is the same false positive on a read-only
+# command that #1372 reports. os.open has its own flag clause below.
+_BDW_PY_VARMODE="(^|[^.])open\(.*,[^'\"]*\)|\b(io|tarfile|gzip|bz2|lzma|shelve)\.open\(.*,[^'\"]*\)"
+
+# The clause above asks whether a quote appears anywhere after the first comma,
+# so any quoted argument hides a variable mode sitting next to it:
+# `open(p, mode, encoding='utf-8')` and `codecs.open(p, mode, 'utf-8')` are
+# writes, but the `'utf-8'` makes them read as reads. This clause looks at the
+# argument itself instead of at the rest of the call.
+#
+# It matches a second positional argument that is a bare name — optionally
+# dotted, optionally called — followed by a `,` or a `)`, whatever comes after
+# it; and separately a `mode=` whose value starts with a letter or underscore
+# rather than a quote. The first argument is `[^,()]` or one nested `(...)`
+# group, so `open(os.path.join(d,'f'), m)` still matches while the leading
+# `open(` is not confused by a comma inside that first argument.
+#
+# `os.open` is excluded from the positional half for the same reason as above.
+# A literal `os.open(p, flags, mode=perm)` can still reach the `mode=` half and
+# read as a write; that direction is safe, and the form is rare.
+_BDW_PY_VARMODE2="((^|[^.A-Za-z0-9_])|\b(io|tarfile|gzip|bz2|lzma|codecs)\.)open\(([^,()]|\([^()]*\))*,[[:space:]]*[A-Za-z_][A-Za-z0-9_.]*(\([^()]*\))?[[:space:]]*[,)]|\bopen\(.*\bmode[[:space:]]*=[[:space:]]*[A-Za-z_]"
+
+# `os.open()` takes integer flags, not a mode string. These are its write
+# flags. `.*` for the same nested-call reason as above.
+_BDW_PY_OSOPEN="\bos\.open\(.*O_(WRONLY|RDWR|CREAT|APPEND|TRUNC)"
+
+# `shelve.open()` has its own mode alphabet: 'c' creates if absent, 'n' always
+# creates new, 'w' opens for writing. Only 'r' is read-only, and none of the
+# write letters appear in the file-mode class above.
+_BDW_PY_SHELVE="\bshelve\.open\(.*\\\\?['\"][cnw]"
+
+# `.extractall(` covers tarfile and zipfile extraction, both of which write
+# files. `dev` caught the tarfile form only because every `.tar` path contains
+# the letter `a`; it never caught the zipfile form at all. Matching the
+# extraction call itself is what the shell-side `tar -x` matcher already does.
+_BDW_PYTHON_WRITE_RE="\.write_text\b|\.write\b|\bopen\(.*,.*${_BDW_PY_MODE}|\.open\(.*${_BDW_PY_MODE}|${_BDW_PY_VARMODE}|${_BDW_PY_VARMODE2}|${_BDW_PY_OSOPEN}|${_BDW_PY_SHELVE}|\bopen\(\*|\.touch\(|\.extractall\(|\bshutil\.(copy|copyfile|copy2|copytree|move)\b|\bos\.rename\b"
+
 # 9. Embedded Python (-c) with write keywords. Extended in #153 to include
 #    pathlib touch, shutil copy*/move, os.rename.
 _bdw_match_python_dash_c() {
   local cmd="$1"
-  echo "$cmd" | grep -qE '\bpython3?[[:space:]]+(-[^c]*[[:space:]]+)?-c\b' || return 1
-  echo "$cmd" | grep -qE '\.write_text\b|\.write\b|\bopen\([^)]*[wa+]|\.touch\(|\bshutil\.(copy|copyfile|copy2|copytree|move)\b|\bos\.rename\b'
+  echo "$cmd" | grep -qE "$_BDW_PYTHON_DASH_C_RE" || return 1
+  echo "$cmd" | grep -qE "$_BDW_PYTHON_WRITE_RE"
 }
 
 # 10. Heredoc-fed Python. Extended in #153 for the same keyword list.
 _bdw_match_python_heredoc() {
   local cmd="$1"
   echo "$cmd" | grep -qE '\bpython3?[[:space:]]+(-[[:space:]]+)?<<' || return 1
-  echo "$cmd" | grep -qE '\.write_text\b|\.write\b|\bopen\([^)]*[wa+]|\.touch\(|\bshutil\.(copy|copyfile|copy2|copytree|move)\b|\bos\.rename\b'
+  echo "$cmd" | grep -qE "$_BDW_PYTHON_WRITE_RE"
 }
 
 # 11. Embedded Node (-e) with write keywords.
@@ -608,8 +795,10 @@ _bdw_match_script_runner() {
 }
 
 bash_command_appears_to_write() {
-  local cmd="$1"
-  [ -z "$cmd" ] && return 1
+  local raw="$1" cmd operators
+  [ -z "$raw" ] && return 1
+  cmd=$(_bdw_syntax "$raw")
+  operators=$(_bdw_operators "$raw")
 
   # Segment-aware (apexyard#886/#926 round 5) — see
   # _bdw_match_redirection_any_segment for why matching the WHOLE, unsplit
@@ -618,7 +807,7 @@ bash_command_appears_to_write() {
   #
   # Keep this list in step with _bdw_detects_other_write (#1414). A family
   # added here and not there reopens the sed `w` decoy gap for it.
-  _bdw_match_redirection_any_segment "$cmd" && return 0
+  _bdw_match_redirection_any_segment "$operators" && return 0
   _bdw_match_tee             "$cmd" && return 0
   _bdw_match_sed_inplace     "$cmd" && return 0
   _bdw_match_sed_write       "$cmd" && return 0
@@ -627,6 +816,9 @@ bash_command_appears_to_write() {
   _bdw_match_tar_extract     "$cmd" && return 0
   _bdw_match_curl_output     "$cmd" && return 0
   _bdw_match_wget_output     "$cmd" && return 0
+  _bdw_match_git_log_diff_output "$cmd" && return 0
+  _bdw_match_sort_output     "$cmd" && return 0
+  _bdw_match_yq_inplace      "$cmd" && return 0
   _bdw_match_python_dash_c   "$cmd" && return 0
   _bdw_match_python_heredoc  "$cmd" && return 0
   _bdw_match_node_dash_e     "$cmd" && return 0
@@ -637,6 +829,45 @@ bash_command_appears_to_write() {
   _bdw_match_php_dash_r      "$cmd" && return 0
   _bdw_match_script_runner   "$cmd" && return 0
 
+  # sed scripts and inline interpreter programs are executed by their own
+  # tools. Their source is quoted shell data, so inspect it only after the
+  # scrubbed command identifies the actual executable and option.
+  if [ "$cmd" != "$raw" ]; then
+    _bdw_quoted_source_write "$cmd" "$raw" && return 0
+  fi
+
+  return 1
+}
+
+_bdw_quoted_source_write() {
+  local syntax="$1" raw="$2"
+  if printf '%s' "$syntax" | grep -qE '(^|[;&|()[:space:]])sed[[:space:]]'; then
+    _bdw_match_sed_write "$raw" && return 0
+  fi
+  if printf '%s' "$syntax" | grep -qE "$_BDW_PYTHON_DASH_C_RE"; then
+    _bdw_match_python_dash_c "$raw" && return 0
+  fi
+  if printf '%s' "$syntax" | grep -qE '\bpython3?[[:space:]]+(-[[:space:]]+)?<<'; then
+    _bdw_match_python_heredoc "$raw" && return 0
+  fi
+  if printf '%s' "$syntax" | grep -qE '\bnode[[:space:]]+(-[^e]*[[:space:]]+)?-e\b'; then
+    _bdw_match_node_dash_e "$raw" && return 0
+  fi
+  if printf '%s' "$syntax" | grep -qE '\bnode[[:space:]]*<<'; then
+    _bdw_match_node_heredoc "$raw" && return 0
+  fi
+  if printf '%s' "$syntax" | grep -qE '\bruby[[:space:]]+(-[^e]*[[:space:]]+)?-e\b'; then
+    _bdw_match_ruby_dash_e "$raw" && return 0
+  fi
+  if printf '%s' "$syntax" | grep -qE '\bruby[[:space:]]*<<'; then
+    _bdw_match_ruby_heredoc "$raw" && return 0
+  fi
+  if printf '%s' "$syntax" | grep -qE '\bperl[[:space:]]+(-[^e]*[[:space:]]+)?-e\b'; then
+    _bdw_match_perl_dash_e "$raw" && return 0
+  fi
+  if printf '%s' "$syntax" | grep -qE '\bphp[[:space:]]+(-[^r]*[[:space:]]+)?-r\b'; then
+    _bdw_match_php_dash_r "$raw" && return 0
+  fi
   return 1
 }
 
@@ -654,8 +885,10 @@ bash_command_appears_to_write() {
 # Returns 0 (deletion only), 1 (content-writing detected or not an rm command).
 # ------------------------------------------------------------------------------
 bash_command_is_deletion_only() {
-  local cmd="$1"
-  [ -z "$cmd" ] && return 1
+  local raw="$1" cmd operators
+  [ -z "$raw" ] && return 1
+  cmd=$(_bdw_syntax "$raw")
+  operators=$(_bdw_operators "$raw")
 
   # Must match _bdw_match_file_movers (covers rm / cp / mv / dd / install).
   _bdw_match_file_movers "$cmd" || return 1
@@ -671,7 +904,7 @@ bash_command_is_deletion_only() {
   # here would miss `rm x; false ||> src/app.ts` (a real write hiding
   # behind a `|`/`||`-adjacent redirect), wrongly classifying it as
   # deletion-only and exempting it from the ticket gate.
-  _bdw_match_redirection_any_segment "$cmd" && return 1
+  _bdw_match_redirection_any_segment "$operators" && return 1
   _bdw_match_tee            "$cmd" && return 1
   _bdw_match_sed_inplace    "$cmd" && return 1
   _bdw_match_sed_write      "$cmd" && return 1
@@ -679,6 +912,9 @@ bash_command_is_deletion_only() {
   _bdw_match_tar_extract    "$cmd" && return 1
   _bdw_match_curl_output    "$cmd" && return 1
   _bdw_match_wget_output    "$cmd" && return 1
+  _bdw_match_git_log_diff_output "$cmd" && return 1
+  _bdw_match_sort_output    "$cmd" && return 1
+  _bdw_match_yq_inplace     "$cmd" && return 1
   _bdw_match_python_dash_c  "$cmd" && return 1
   _bdw_match_python_heredoc "$cmd" && return 1
   _bdw_match_node_dash_e    "$cmd" && return 1
@@ -688,6 +924,9 @@ bash_command_is_deletion_only() {
   _bdw_match_perl_dash_e    "$cmd" && return 1
   _bdw_match_php_dash_r     "$cmd" && return 1
   _bdw_match_script_runner  "$cmd" && return 1
+  if [ "$cmd" != "$raw" ]; then
+    _bdw_quoted_source_write "$cmd" "$raw" && return 1
+  fi
 
   # Only rm matched — deletion-only operation.
   return 0
@@ -725,7 +964,7 @@ bash_command_is_deletion_only() {
 #     empty for `diff a >(sort)` rather than fabricating `(sort)`.
 # ------------------------------------------------------------------------------
 bash_extract_write_target() {
-  local cmd="$1"
+  local cmd="$1" syntax="${2:-$1}"
   [ -z "$cmd" ] && return 0
 
   # Output redirection: capture the first target after >, >>, &>, &>>, >|,
@@ -777,7 +1016,7 @@ bash_extract_write_target() {
   fi
 
   # tee: capture the first non-flag argument after `tee`.
-  if echo "$cmd" | grep -qE '\btee\b'; then
+  if echo "$syntax" | grep -qE '\btee\b'; then
     target=$(echo "$cmd" | grep -oE '\btee\b[[:space:]]+(-[^[:space:]]+[[:space:]]+)*[^[:space:]&|;]+' \
                   | head -n 1 \
                   | sed -E 's/^tee[[:space:]]+(-[^[:space:]]+[[:space:]]+)*//')
@@ -826,6 +1065,49 @@ bash_extract_write_target() {
     fi
   fi
 
+  # git log|diff --output / --output= (#1480).
+  # Pass the pattern with -e so BSD grep does not eat `--output=…` as a flag.
+  if _bdw_match_git_log_diff_output "$cmd"; then
+    target=$(echo "$cmd" | grep -oE -e '--output=[^[:space:]&|;]+' -e '--output[[:space:]]+[^[:space:]&|;]+' \
+                  | head -n 1 \
+                  | sed -E 's/^--output(=|[[:space:]]+)//')
+    if [ -n "$target" ]; then
+      target=$(_bdw_strip_quotes "$target")
+      echo "$target"
+      return 0
+    fi
+  fi
+
+  # sort -o / -uo / -oFILE / --output (#1480).
+  if _bdw_match_sort_output "$cmd"; then
+    target=$(echo "$cmd" | grep -oE \
+                  -e '-[A-Za-z0-9]*o[A-Za-z0-9]*[[:space:]]+[^[:space:]&|;]+' \
+                  -e '-o[^[:space:]=][^[:space:]&|;]*' \
+                  -e '--output=[^[:space:]&|;]+' \
+                  -e '--output[[:space:]]+[^[:space:]&|;]+' \
+                  | head -n 1 \
+                  | sed -E 's/^(-[A-Za-z0-9]*o[A-Za-z0-9]*[[:space:]]+|-o|--output(=|[[:space:]]+))//')
+    if [ -n "$target" ]; then
+      target=$(_bdw_strip_quotes "$target")
+      echo "$target"
+      return 0
+    fi
+  fi
+
+  # yq -i / --inplace: last path-like positional (#1480).
+  if _bdw_match_yq_inplace "$cmd"; then
+    local seg
+    seg=$(echo "$cmd" | sed -E 's/[[:space:]]*[|;&].*$//')
+    target=$(echo "$seg" | awk '{print $NF}')
+    if [ -n "$target" ] && ! echo "$target" | grep -qE '^-'; then
+      target=$(_bdw_strip_quotes "$target")
+      if echo "$target" | grep -qE '^[A-Za-z0-9./_~-]+$'; then
+        echo "$target"
+        return 0
+      fi
+    fi
+  fi
+
   # cp / mv: target is the LAST positional argument (#153).
   # Approximate: tokenise on whitespace, strip pipeline tail, take the last
   # non-flag token. Skip this for `git rm`/`git mv` (subcommands).
@@ -859,6 +1141,21 @@ _bdw_strip_quotes() {
   printf '%s\n' "$t"
 }
 
+# Recover a cp/mv destination before an output redirect. The ordinary
+# single-target extractor sees the redirect first and would return only its
+# exempt target (#1416). Return empty when the destination is uncertain.
+_bdw_cp_mv_target_before_redirect() {
+  local seg="$1" syntax="$2" prefix target
+  printf '%s' "$syntax" | grep -qE '(^|[;&|()[:space:]])(cp|mv)[[:space:]]' || return 0
+  case "$seg" in *'>'*) ;; *) return 0 ;; esac
+  prefix="${seg%%>*}"
+  prefix="${prefix%&}"
+  prefix=$(printf '%s' "$prefix" | sed -E 's/[[:space:]]+[0-9]+$//')
+  target=$(bash_extract_write_target "$prefix" "$syntax")
+  printf '%s' "$target" | grep -qE '^[A-Za-z0-9./_~-]+$' || return 0
+  printf '%s\n' "$target"
+}
+
 # ------------------------------------------------------------------------------
 # Internal: _bdw_targets_from_segment SEGMENT
 #
@@ -875,7 +1172,7 @@ _bdw_strip_quotes() {
 # match" and "only match" coincide for those families.
 # ------------------------------------------------------------------------------
 _bdw_targets_from_segment() {
-  local seg="$1"
+  local seg="$1" syntax="${2:-$1}"
   local line target tee_tail
 
   # ALL redirection targets in this segment (not just the first) — covers
@@ -925,6 +1222,8 @@ _bdw_targets_from_segment() {
     [ -n "$target" ] && _bdw_strip_quotes "$target"
   done < <(printf '%s\n' "$seg" | grep -oE "$_BDW_REDIRECT_RE")
 
+  _bdw_cp_mv_target_before_redirect "$seg" "$syntax"
+
   # ALL tee operands in this segment — `tee a b c` names three targets, not
   # one; the original single-target extractor only ever returned "a".
   #
@@ -936,7 +1235,7 @@ _bdw_targets_from_segment() {
   # GNU-compatible on this point); the strip-the-"tee"-token step below
   # uses plain anchored parameter expansion instead of sed, sidestepping
   # the incompatibility entirely.
-  if printf '%s\n' "$seg" | grep -qE '\btee\b'; then
+  if printf '%s\n' "$syntax" | grep -qE '\btee\b'; then
     tee_tail=$(printf '%s\n' "$seg" | grep -oE '\btee\b[[:space:]].*' | head -n 1)
     tee_tail="${tee_tail#tee}"
     local skip_flags=1
@@ -965,7 +1264,7 @@ _bdw_targets_from_segment() {
   # a segment is one command, so "first match in the segment" IS "the
   # match". (This may re-emit a redirection/tee target already captured
   # above; bash_extract_write_targets dedupes the combined output.)
-  target=$(bash_extract_write_target "$seg")
+  target=$(bash_extract_write_target "$seg" "$syntax")
   [ -n "$target" ] && printf '%s\n' "$target"
 }
 
@@ -986,14 +1285,30 @@ _bdw_targets_from_segment() {
 # begin" and can't drift apart again.
 # ------------------------------------------------------------------------------
 bash_extract_write_targets() {
-  local cmd="$1"
-  [ -z "$cmd" ] && return 0
+  local raw="$1" cmd sed_cmd syntax
+  local -a syntax_segments=()
+  [ -z "$raw" ] && return 0
+  bash_command_appears_to_write "$raw" || return 0
+  cmd=$(_bdw_operators "$raw")
+  syntax=$(_bdw_syntax "$raw")
+  sed_cmd="$cmd"
+  if printf '%s' "$syntax" | grep -qE '(^|[;&|()[:space:]])sed[[:space:]]'; then
+    sed_cmd="$raw"
+  fi
 
-  local seg seg_targets
+  local seg
+  while IFS= read -r seg; do
+    syntax_segments+=("$seg")
+  done < <(_bdw_split_top_level "$syntax")
+
+  local seg_targets
   seg_targets=$(
+    local index=0
     while IFS= read -r seg; do
+      local syntax_seg="${syntax_segments[index]:-}"
+      index=$((index + 1))
       [ -z "$seg" ] && continue
-      _bdw_targets_from_segment "$seg"
+      _bdw_targets_from_segment "$seg" "$syntax_seg"
     done < <(_bdw_split_top_level "$cmd")
   )
   {
@@ -1016,9 +1331,74 @@ bash_extract_write_targets() {
     # target can only add a reason to block, because the gate requires
     # every target to pass.
     if [ -n "$seg_targets" ] || ! _bdw_detects_other_write "$cmd"; then
-      _bdw_sed_write_targets "$cmd"
+      _bdw_sed_write_targets "$sed_cmd"
     fi
-  } | awk '!seen[$0]++'
+  } | awk '!seen[$0]++' | {
+    if declare -F unmask_bash_command_operators >/dev/null 2>&1; then
+      unmask_bash_command_operators
+    else
+      cat
+    fi
+  }
+}
+
+# Public: report a write family whose destination cannot be named. This is
+# independent of the extracted redirect list: an exempt redirect must not
+# hide a sibling inline edit or interpreter write (#1416).
+bash_command_has_unextractable_write() {
+  local raw="$1" syntax operators sed_target yq_target segment index
+  local -a syntax_segments=() operator_segments=()
+  [ -n "$raw" ] || return 1
+  syntax=$(_bdw_syntax "$raw")
+  operators=$(_bdw_operators "$raw")
+
+  _bdw_match_awk_inplace "$syntax" && return 0
+  _bdw_match_tar_extract "$syntax" && return 0
+  _bdw_match_script_runner "$syntax" && return 0
+  # The presence matchers accept these equals forms, but the target
+  # extractors accept only a separate path word.
+  if printf '%s' "$syntax" | grep -qE '\b(curl[[:space:]][^|;&]*--output=|wget[[:space:]][^|;&]*--output-document=)'; then
+    return 0
+  fi
+  if printf '%s' "$syntax" | grep -qE '(^|[;&|()[:space:]])(dd|install)[[:space:]]'; then
+    return 0
+  fi
+  # yq -i with no extractable file path is unextractable (#1480).
+  if _bdw_match_yq_inplace "$syntax"; then
+    yq_target=$(bash_extract_write_target "$syntax")
+    printf '%s' "$yq_target" | grep -qE '^[A-Za-z0-9./_~-]+$' || return 0
+  fi
+  while IFS= read -r segment; do
+    syntax_segments+=("$segment")
+  done < <(_bdw_split_top_level "$syntax")
+  while IFS= read -r segment; do
+    operator_segments+=("$segment")
+  done < <(_bdw_split_top_level "$operators")
+  [ "${#syntax_segments[@]}" -eq "${#operator_segments[@]}" ] || return 0
+  for ((index=0; index<${#syntax_segments[@]}; index++)); do
+    if printf '%s' "${syntax_segments[index]}" | grep -qE '(^|[;&|()[:space:]])(cp|mv)[[:space:]]' \
+        && printf '%s' "${operator_segments[index]}" | grep -q '>'; then
+      [ -n "$(_bdw_cp_mv_target_before_redirect "${operator_segments[index]}" "${syntax_segments[index]}")" ] || return 0
+    fi
+    if _bdw_match_sed_inplace "${syntax_segments[index]}"; then
+      # A redirect target or a quoted argument in a sibling command is not
+      # evidence that this sed edit has an extractable file operand.
+      sed_target=$(printf '%s' "${operator_segments[index]}" \
+        | sed -nE "s/.*'[^']*'[[:space:]]+([^[:space:]&|;<>]+).*/\1/p" | head -1)
+      printf '%s' "$sed_target" | grep -qE '^[A-Za-z0-9./_~-]+$' || return 0
+    fi
+  done
+  if printf '%s' "$syntax" | grep -qE '(^|[;&|()[:space:]])sed[[:space:]]' \
+      && _bdw_match_sed_write "$raw"; then
+    [ -n "$(_bdw_sed_write_targets "$operators")" ] || return 0
+  fi
+  _bdw_quoted_source_write "$syntax" "$raw" || return 1
+  # sed w with a named target is handled above; the remaining matches are
+  # inline programs and heredoc-fed interpreters with unknown destinations.
+  if printf '%s' "$syntax" | grep -qE '\b(python3?|node|ruby|perl|php)[[:space:]]'; then
+    return 0
+  fi
+  return 1
 }
 
 # ------------------------------------------------------------------------------
@@ -1044,6 +1424,9 @@ _bdw_detects_other_write() {
   _bdw_match_tar_extract     "$c" && return 0
   _bdw_match_curl_output     "$c" && return 0
   _bdw_match_wget_output     "$c" && return 0
+  _bdw_match_git_log_diff_output "$c" && return 0
+  _bdw_match_sort_output     "$c" && return 0
+  _bdw_match_yq_inplace      "$c" && return 0
   _bdw_match_python_dash_c   "$c" && return 0
   _bdw_match_python_heredoc  "$c" && return 0
   _bdw_match_node_dash_e     "$c" && return 0
