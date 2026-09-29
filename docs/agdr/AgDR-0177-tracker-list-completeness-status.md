@@ -1,6 +1,9 @@
 # Report tracker_list completeness through a status variable
 
-> In the context of skills that list issues from a tracker, facing short and failed reads that look like complete reads, I decided to report a completeness status from `tracker_list` and pass an explicit default limit, to achieve callers that can tell a complete read from a partial one, accepting a new caller contract and a changed default limit on adapters.
+> Context: skills list issues from a tracker. Concern: a short or failed read looks like a complete
+> one. Decision: report a completeness status from `tracker_list`, and pass an explicit default
+> limit. Goal: a caller can tell a complete read from a partial one. Trade-off: a new caller
+> contract, and an explicit default limit on the `gh` and `glab` adapters.
 
 ## Context
 
@@ -23,23 +26,25 @@ This is the reusable half of the `/duty` proposal in #1360. The premise check on
 
 ## Decision
 
-Chosen: **set `TRACKER_LIST_STATUS` beside the returned array, and ship `tracker_list_to` for callers that use a command substitution**, because together they add the missing fact without changing the JSON that current callers parse.
+Chosen: **set `TRACKER_LIST_STATUS` beside the returned array, and ship `tracker_list_to` for a command substitution.** Together they add the missing fact. Neither changes the JSON that current callers parse.
 
 `tracker_list_to <outfile> <repo> [filters]` writes the array to a file and echoes the verdict on stdout, so `status=$(tracker_list_to …)` returns it. Review found that the variable alone is not enough: the natural caller shape is `items=$(tracker_list …)`, and a subshell cannot pass a variable back. Both reviewers reproduced a failed read reporting `COMPLETE` through a stale value, which is the exact failure this change exists to remove.
 
-- `tracker_fetch_status <rc> <count> <limit> [repo]` returns `COMPLETE`, `TRUNCATED`, or `UNKNOWN`. It is pure, so a caller can also use it on its own reads.
+- `tracker_fetch_status <rc> <count> <limit> [repo] [kind]` returns `COMPLETE`, `TRUNCATED`, or `UNKNOWN`. It is pure, so a caller can also use it on its own reads. A caller that already resolved the kind passes it, which saves a second registry read.
 - `tracker_page_cap <repo>` reports the adapter's maximum page size. GitLab is 100, and every other adapter is 0, which means no cap.
 - `tracker_list` sets `TRACKER_LIST_STATUS` on every exit path, and sets `UNKNOWN` before any work so an early return cannot leave a stale value.
 - `tracker_list` passes an explicit limit, from `tracker.list_default_limit` (default 30), when the caller gives none. The `custom` adapter is excluded, because it passes the value through `TRACKER_LIMIT`, which was empty for a no-limit call. An operator's `list_command` may read empty as "no limit", so defaulting it would change the returned set.
-- The status reads the count the server returned, before the client-side `since` filter, so a filtered-down array does not read as `COMPLETE`. A raw payload that is neither a JSON array nor mapped by `list_normalise_jq` cannot be counted, and reports `UNKNOWN`.
+- The status reads the count the server returned, before the client-side `since` filter, so a filtered-down array does not read as `COMPLETE`. Only a raw JSON array is counted. A custom adapter's other shapes report `UNKNOWN`, because `list_normalise_jq` may select rows, and counting its output would count the operator's selection rather than the server page.
 
-The config read runs inside a subshell. `_tracker_load_config_lib` sources `_lib-read-config.sh` into its caller's shell, and doing that anywhere inside `tracker_list` changes how the tracker kind resolves for the rest of the call. Review measured this: `test_tracker_list.sh`'s two stderr-passthrough cases fail whenever the load happens in that shell, at any position in the function. Position is not the invariant, so an earlier version of this record and its code comment were both wrong. The subshell keeps `tracker_list`'s own shell unchanged. Why sourcing the config library perturbs kind resolution is not yet understood, and is worth a separate investigation.
+The config read runs inside a subshell, because the load leaks out of the function otherwise. `_tracker_load_config_lib` sources `_lib-read-config.sh` into its caller's shell and short-circuits on `command -v config_get_or`. Sourcing it inside `tracker_list` leaves that definition in the caller's shell and in every subshell the caller later spawns. A later `tracker_issue_kind` then short-circuits its own load and keeps reading through a config reader anchored to wherever the first load happened, so the tracker kind can resolve wrongly. Review measured this twice: `test_tracker_list.sh`'s two stderr-passthrough cases fail that way, with the dispatch reading `kind=gh` where the project configures `glab` or `custom`. The blast radius is the caller's shell and its later calls, not the rest of the current call. Two earlier versions of this record described the mechanism wrongly.
 
 ## Consequences
 
 - A caller that reads `TRACKER_LIST_STATUS` inside a command substitution does not see it, because a subshell does not export back. Callers run `tracker_list` in the current shell, or call `tracker_list_to`. The skill guidance uses `tracker_list_to`, and a regression test covers the substitution shape.
 - The `gh` and `glab` adapters now always receive a limit. The value matches each CLI's own previous default of 30, so the returned set does not change. The `custom` adapter is unchanged, and a custom call with no caller limit reports `UNKNOWN` rather than a verdict against a limit nobody chose.
 - A caller that passes a non-numeric `limit` now gets the default instead of an adapter error. That caller bug is quieter than before.
+- A caller that sees `TRUNCATED` raises the limit and reads again, then reports "at least N" if the second read is still truncated. `/inbox` and `/tasks` both show that retry. `/stakeholder-update` states the same rule in prose.
+- `UNKNOWN` carries two meanings, separated by the exit status. A non-zero status is a failed read. A zero status is a successful read whose completeness the library cannot judge, which is what a custom adapter with no caller limit returns. Caller guidance must split on the status, or it reports a healthy read as a failure.
 - A `glab` read that returns 100 items stays `TRUNCATED` at any requested limit. This was inferred from the adapter code and was not run against GitLab.
 - `/inbox` and `/tasks` still need their own retry loop. This change gives them the signal, not the loop.
 

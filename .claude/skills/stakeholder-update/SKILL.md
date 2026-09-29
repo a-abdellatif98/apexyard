@@ -69,8 +69,10 @@ The skill pulls from:
 The `tracker_list` row passes no `limit`, so it takes the configured default
 (`tracker.list_default_limit`, 30). A busy period closes more than 30 issues, and the read is then
 a short one. Call it through `tracker_list_to` and read the verdict, as `/inbox` does: on
-`TRUNCATED`, raise the limit or say the list is partial. On `UNKNOWN`, say the period could not be
-read. Never report zero resolved issues from a failed read (#1441).
+`TRUNCATED`, raise the limit or say the list is partial. On `UNKNOWN`, check the exit status: a
+non-zero status means the period could not be read, and a zero status means the rows are good but
+their completeness is unknown, which is what a custom tracker returns when no `limit` is passed.
+Never report zero resolved issues from a failed read (#1441).
 
 > **Scope caveat (forge axis, #711).** The **PR** rows still call `gh pr list` (the PR/MR forge abstraction is a separate ticket), so `/stakeholder-update` is *issue-axis* tracker-agnostic — the "resolved issues" row works on GitLab-tracked projects; the "shipped / in-flight PRs" rows are GitHub-only until #711. The `since` filter on non-GitHub trackers is applied client-side on `updatedAt` (gh applies it server-side via the `closed:>=` search qualifier).
 

@@ -1213,12 +1213,15 @@ tracker_list() {
   # list_command may read empty as "no limit". Defaulting it would change the
   # returned set. A custom adapter with no caller limit reports UNKNOWN below.
   #
-  # The config read runs in a SUBSHELL. `_tracker_load_config_lib` sources
-  # `_lib-read-config.sh` into the shell that calls it, and sourcing it inside
-  # tracker_list changes how the tracker kind resolves for the rest of the
-  # call: test_tracker_list.sh's two stderr-passthrough cases fail whenever
-  # that load happens here, at any position in this function. Reading the
-  # value in a subshell keeps this shell unchanged.
+  # The config read runs in a SUBSHELL, because the load leaks out of this
+  # function otherwise. `_tracker_load_config_lib` sources
+  # `_lib-read-config.sh` into its caller's shell and short-circuits on
+  # `command -v config_get_or`. Sourcing it here would leave that definition in
+  # the CALLER's shell, and in every subshell the caller later spawns. A later
+  # `tracker_issue_kind` then short-circuits its own load and keeps reading
+  # through a config reader anchored to wherever the first load happened, so
+  # the kind can resolve wrongly. test_tracker_list.sh's two stderr-passthrough
+  # cases fail exactly this way. A subshell keeps the definition out.
   case "$kind" in
     custom) : ;;
     *)
@@ -1226,7 +1229,7 @@ tracker_list() {
         ''|*[!0-9]*)
           f_limit=$(
             _tracker_load_config_lib >/dev/null 2>&1 \
-              && config_get_or '.tracker.list_default_limit' '30'
+              && config_get_or '.tracker.list_default_limit' '30' 2>/dev/null
           )
           case "$f_limit" in ''|*[!0-9]*) f_limit=30 ;; esac
           [ "${#f_limit}" -gt 6 ] && f_limit=30
@@ -1259,14 +1262,17 @@ tracker_list() {
     return 1
   fi
 
-  # Completeness is judged on what the SERVER returned, so it must be counted
-  # before the client-side `since` filter below drops any row. A raw payload
-  # that is not a JSON array (the documented custom-adapter shape, mapped by
-  # .tracker.list_normalise_jq) is counted from the normalised array here,
-  # which at this point still holds every row the server sent.
+  # Completeness is judged on what the SERVER returned, so it is counted here,
+  # before the client-side `since` filter below drops any row.
+  #
+  # Only a raw JSON array is countable. A custom adapter may emit another
+  # shape, which `.tracker.list_normalise_jq` maps, and that expression is free
+  # to select rows (`.items | map(select(...))`). Counting the normalised array
+  # would then count the operator's selection rather than the server page, and
+  # report a full page as COMPLETE. An empty `served` makes the verdict
+  # UNKNOWN, which is the honest answer for a page this library cannot count.
   local served
   served=$(printf '%s' "$raw" | jq -r 'if type == "array" then length else empty end' 2>/dev/null)
-  [ -n "$served" ] || served=$(printf '%s' "$normalised" | jq -r 'if type == "array" then length else empty end' 2>/dev/null)
 
   # Client-side `since` for adapters that don't apply it server-side (glab /
   # custom). gh already handled it via the search qualifier above. Items with no

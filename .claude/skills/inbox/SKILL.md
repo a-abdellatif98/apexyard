@@ -40,17 +40,27 @@ failure, and a result that fills the limit may be a short read. Use `tracker_lis
 the array to a file and returns the verdict on stdout:
 
 ```bash
-tmp=$(mktemp)
-status=$(tracker_list_to "$tmp" "$repo" state=open assignee=@me limit=50 2>/dev/null)
+tmp=$(mktemp) || return 1
+status=$(tracker_list_to "$tmp" "$repo" state=open assignee=@me limit=50 2>/dev/null); rc=$?
 if [ "$status" = "TRUNCATED" ]; then
-  status=$(tracker_list_to "$tmp" "$repo" state=open assignee=@me limit=200 2>/dev/null)
+  status=$(tracker_list_to "$tmp" "$repo" state=open assignee=@me limit=200 2>/dev/null); rc=$?
 fi
 case "$status" in
-  UNKNOWN)   echo "$repo: could not read issues" ;;                       # never print 0
+  UNKNOWN)
+    if [ "$rc" -ne 0 ]; then
+      echo "$repo: could not read issues"            # a failure, never print 0
+    else
+      echo "$repo: read $(jq -r 'length' < "$tmp"), completeness unknown"
+    fi ;;
   TRUNCATED) echo "$repo: at least $(jq -r 'length' < "$tmp") issues" ;;  # still not the end
 esac
 items=$(cat "$tmp"); rm -f "$tmp"
 ```
+
+**`UNKNOWN` means two different things, and the exit status tells them apart.** A non-zero status
+is a failed read, so report it as unread. A zero status with `UNKNOWN` is a successful read whose
+completeness this library cannot judge: a custom adapter called with no limit, or a payload it
+cannot count. The rows are good. Only the "is that all of them" answer is missing.
 
 **Do not write `items=$(tracker_list …)` and then read `TRACKER_LIST_STATUS`.** Command
 substitution runs the call in a subshell, so the variable never reaches you, and a stale verdict

@@ -158,7 +158,9 @@ assert_eq "since filter drops every row"        "0"         "$(jq -r 'length' < 
 assert_eq "but the server page was still full"  "TRUNCATED" "$TRACKER_LIST_STATUS"
 
 # Case 6 — a custom adapter may emit a wrapper object, which is not a JSON
-# array. The count must still come from before the `since` filter.
+# array. Only a raw array is countable, so the verdict is UNKNOWN: the
+# operator's list_normalise_jq is free to select rows, and counting its output
+# would count that selection rather than the server page.
 tracker_clear_cache
 cat > "$SB/bin/wrapped" <<'EOF'
 #!/bin/bash
@@ -179,21 +181,25 @@ printf '{ "tracker": { "kind": "custom", "list_command": "wrapped", "list_normal
 TRACKER_LIST_STATUS=""
 TRACKER_COUNT=10 tracker_list "w/p" limit=10 > "$SB/wrapped.out" 2>/dev/null
 assert_eq "a wrapper payload normalises to 10 rows" "10" "$(jq -r 'length' < "$SB/wrapped.out")"
-assert_eq "a full wrapper page is TRUNCATED"        "TRUNCATED" "$TRACKER_LIST_STATUS"
+assert_eq "an uncountable wrapper page is UNKNOWN"  "UNKNOWN" "$TRACKER_LIST_STATUS"
 
+# The dangerous shape: a normalise expression that SELECTS rows. Counting its
+# output would report this full server page as COMPLETE.
+printf '{ "tracker": { "kind": "custom", "list_command": "wrapped", "list_normalise_jq": ".items | map(select(.number <= 5))" } }\n' \
+  > "$SB/.claude/project-config.json"
+tracker_clear_cache
 TRACKER_LIST_STATUS=""
-TRACKER_COUNT=10 tracker_list "w/p" limit=10 since=2099-01-01 > "$SB/wrapped2.out" 2>/dev/null
-assert_eq "since empties the wrapper result"                "0" "$(jq -r 'length' < "$SB/wrapped2.out")"
-assert_eq "the full wrapper page is still TRUNCATED"        "TRUNCATED" "$TRACKER_LIST_STATUS"
+TRACKER_COUNT=10 tracker_list "w/p" limit=10 > "$SB/sel.out" 2>/dev/null
+assert_eq "a selecting normalise never reports COMPLETE" "UNKNOWN" "$TRACKER_LIST_STATUS"
 
-# A wrapper payload with no list_normalise_jq mapping is not countable. The
-# verdict must be UNKNOWN, never a confident COMPLETE.
+# A wrapper payload with no list_normalise_jq mapping is not countable either.
 printf '{ "tracker": { "kind": "custom", "list_command": "wrapped" } }\n' > "$SB/.claude/project-config.json"
 tracker_clear_cache
 TRACKER_LIST_STATUS=""
 TRACKER_COUNT=10 tracker_list "w/p" limit=10 > /dev/null 2>&1
-assert_eq "an uncountable payload is UNKNOWN" "UNKNOWN" "$TRACKER_LIST_STATUS"
+assert_eq "an unmapped payload is UNKNOWN" "UNKNOWN" "$TRACKER_LIST_STATUS"
 rm -f "$SB/.claude/project-config.json"
+
 
 # Case 7 — a custom adapter with no caller limit keeps its previous behaviour:
 # TRACKER_LIMIT stays empty, so the returned set does not change. The verdict
