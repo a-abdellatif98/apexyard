@@ -28,6 +28,11 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 # Test isolation: don't let a live session pin escape onto the real fork.
 unset APEXYARD_OPS_PIN_DIR CLAUDE_CODE_SESSION_ID 2>/dev/null || true
 export APEXYARD_OPS_DISABLE_PIN=1
@@ -1638,6 +1643,23 @@ do
   fi
   rm -rf "$SB"
 done
+
+# --- #1502 (review of PR #1516): a sed `w` migration file next to an
+# interpreter write must still reach this gate. The extractor held such a
+# target back, and this gate exits 0 on an empty list. No ticket: block.
+SB=$(make_fork)
+for c in \
+  "python3.12 -c \"open('x','w').write('y')\" ; sed -n 'w migrations/001_add_table.sql' in.txt" \
+  "python3 -W error::ResourceWarning -c \"open('x','w').write('y')\" ; sed -n 'w migrations/001_add_table.sql' in.txt" \
+  "python3 -c \"open('x','w').write('y')\" && sed -n 'w migrations/001_add_table.sql' in.txt" \
+  "python3 -c \"open('x','w').write('y')\" ; sed -n 'w migrations/001_add_table.sql' in.txt"; do
+  if run_hook_bash "$SB" "$c" 2; then
+    record_pass "#1502 sed w migration target next to an interpreter write blocks: $c"
+  else
+    record_fail "#1502 sed w migration target next to an interpreter write blocks: $c"
+  fi
+done
+rm -rf "$SB"
 
 # =============================================================================
 # Summary

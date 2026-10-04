@@ -7,11 +7,17 @@
 # macOS /bin/bash 3.2: no associative arrays, no mapfile, no ${var,,}.
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 HOOKS="${HOOKS_OVERRIDE:-$ROOT/.claude/hooks}"
-SNAP_HOOKS="${SNAP_HOOKS:-/tmp/ay-1459-snap-39c5b95}"
+SNAP_HOOKS="${SNAP_HOOKS:-}"
 CONFIG_DEFAULTS="${CONFIG_DEFAULTS_OVERRIDE:-$ROOT/.claude/project-config.defaults.json}"
 TMP=$(mktemp -d)
+export GIT_CEILING_DIRECTORIES="$TMP"
 trap 'rm -rf "$TMP"' EXIT
 pass=0
 fail=0
@@ -72,11 +78,14 @@ setup_dispatch_sandbox() {
   cp "$hooks_src/dispatch-bash.sh" "$dest/hooks/dispatch-bash.sh"
   [ -f "$hooks_src/_lib-extract-pr.sh" ] && cp "$hooks_src/_lib-extract-pr.sh" "$dest/hooks/_lib-extract-pr.sh"
   [ -f "$hooks_src/_lib-command-scrub.sh" ] && cp "$hooks_src/_lib-command-scrub.sh" "$dest/hooks/_lib-command-scrub.sh"
+  # _lib-extract-pr.sh sources the tracker library. Copy it so the sandbox
+  # does not depend on finding it through the surrounding git checkout.
+  [ -f "$hooks_src/_lib-tracker.sh" ] && cp "$hooks_src/_lib-tracker.sh" "$dest/hooks/_lib-tracker.sh"
   chmod +x "$dest/hooks/dispatch-bash.sh"
   local script
   for script in block-ambient-tracker-repo.sh block-privileged-escalation.sh \
     require-skill-for-issue-create.sh require-migration-ticket.sh \
-    require-active-ticket.sh suggest-mcp-search.sh warn-review-marker-write.sh \
+    require-active-ticket.sh warn-review-marker-write.sh \
     warn-isolated-build-risk.sh block-reviewer-repo-mutation.sh \
     block-git-add-all.sh block-main-push.sh validate-branch-name.sh \
     pre-push-gate.sh block-agent-routing-drift.sh check-secrets.sh \
@@ -114,32 +123,69 @@ dispatch_has_merge() {
   fi
 }
 
-# Copy commit snapshots from a temporary local repository. Test Git commands
-# run there or in the fixture repositories, never in the source worktree.
-SOURCE_REPO="$TMP/source"
-(cd "$TMP" && git clone -q --no-checkout --no-hardlinks "$ROOT" "$SOURCE_REPO")
-
-# Extract d5e7ce4 hooks into an isolated tree for fail-before proofs.
-D5_HOOKS="$TMP/d5e7ce4-hooks"
-mkdir -p "$TMP/d5root"
-if git -C "$SOURCE_REPO" archive d5e7ce4 .claude/hooks >"$TMP/d5-hooks.tar" 2>/dev/null; then
-  tar -xf "$TMP/d5-hooks.tar" -C "$TMP/d5root"
-  D5_HOOKS="$TMP/d5root/.claude/hooks"
-else
-  echo "WARN: cannot archive d5e7ce4 hooks — skip d5 fail-before proofs" >&2
-  D5_HOOKS=""
+# CI supplies a temporary repository containing the pinned PR snapshots.
+# Clone it into this test's own temporary directory before running git archive.
+# Local runs may omit it and retain visible, non-failing snapshot warnings.
+SOURCE_REPO=""
+if [ -n "${APEXYARD_SNAPSHOT_REPO:-}" ]; then
+  SOURCE_REPO="$TMP/source"
+  if ! git clone -q --no-checkout --no-hardlinks "$APEXYARD_SNAPSHOT_REPO" "$SOURCE_REPO" 2>/dev/null; then
+    SOURCE_REPO=""
+  fi
 fi
 
-# The PR-branch snapshots (39c5b95, d5e7ce4, 1fea730) do not exist after the
-# squash merge to dev. Skip their fail-before proofs when the commit is absent.
-HEAD_HOOKS="$TMP/1fea730-hooks"
-mkdir -p "$HEAD_HOOKS"
-if git -C "$SOURCE_REPO" archive 1fea730 .claude/hooks >"$TMP/1fea730-hooks.tar" 2>/dev/null; then
-  tar -xf "$TMP/1fea730-hooks.tar" -C "$HEAD_HOOKS"
-  HEAD_HOOKS="$HEAD_HOOKS/.claude/hooks"
+missing_snapshot() {
+  if [ "${REQUIRE_SNAPSHOTS:-0}" = "1" ]; then
+    echo "FAIL: required fail-before snapshot $1 is missing" >&2
+    fail=$((fail + 1))
+  else
+    echo "WARN: fail-before snapshot $1 is missing; local proof skipped"
+  fi
+}
+
+archive_snapshot() {
+  local sha="$1" dest="$2"
+  [ -n "$SOURCE_REPO" ] || return 1
+  mkdir -p "$dest"
+  if git -C "$SOURCE_REPO" archive "$sha" .claude/hooks >"$TMP/$sha.tar" 2>/dev/null; then
+    tar -xf "$TMP/$sha.tar" -C "$dest" || return 1
+    [ -f "$dest/.claude/hooks/require-active-ticket.sh" ] || return 1
+    return 0
+  fi
+  return 1
+}
+
+# Full 40-character SHAs for the reviewed PR #1466 snapshots (AgDR-0207).
+# Short prefixes can become ambiguous as history grows.
+SNAP_ARCHIVE="$TMP/39c5b959f0544785c643c6945b487ec579b4a035"
+D5_ARCHIVE="$TMP/d5e7ce4d50e07bd0bd026230e1fb78714e809a27"
+HEAD_ARCHIVE="$TMP/1fea7308d0a6de4412198b1bc645ada8a47a8f05"
+if [ "${REQUIRE_SNAPSHOTS:-0}" != "1" ] && [ -n "$SNAP_HOOKS" ] \
+    && [ -f "$SNAP_HOOKS/require-active-ticket.sh" ]; then
+  :
+elif archive_snapshot 39c5b959f0544785c643c6945b487ec579b4a035 "$SNAP_ARCHIVE"; then
+  SNAP_HOOKS="$SNAP_ARCHIVE/.claude/hooks"
 else
-  echo "WARN: cannot archive 1fea730 hooks — skip 1fea730 fail-before proofs" >&2
+  SNAP_HOOKS=""
+  missing_snapshot 39c5b959f0544785c643c6945b487ec579b4a035
+fi
+if archive_snapshot d5e7ce4d50e07bd0bd026230e1fb78714e809a27 "$D5_ARCHIVE"; then
+  D5_HOOKS="$D5_ARCHIVE/.claude/hooks"
+else
+  D5_HOOKS=""
+  missing_snapshot d5e7ce4d50e07bd0bd026230e1fb78714e809a27
+fi
+if archive_snapshot 1fea7308d0a6de4412198b1bc645ada8a47a8f05 "$HEAD_ARCHIVE"; then
+  HEAD_HOOKS="$HEAD_ARCHIVE/.claude/hooks"
+else
   HEAD_HOOKS=""
+  missing_snapshot 1fea7308d0a6de4412198b1bc645ada8a47a8f05
+fi
+
+if [ "${SNAPSHOT_PREFLIGHT_ONLY:-0}" = "1" ]; then
+  printf 'Snapshot preflight: %s failed\n' "$fail"
+  [ "$fail" -eq 0 ]
+  exit $?
 fi
 
 # Build cases as a label+command list via a directory of files.
@@ -317,8 +363,6 @@ fail_before_ticket() {
 # Fail-before against 39c5b95 snapshot (expect allow / exit 0 — the bypass).
 if [ -d "$SNAP_HOOKS" ] && [ -f "$SNAP_HOOKS/require-active-ticket.sh" ]; then
   fail_before_ticket "$SNAP_HOOKS" "39c5b95" "$CASES_DIR"
-else
-  echo "WARN: SNAP_HOOKS missing at $SNAP_HOOKS — skip 39c5b95 fail-before proofs" >&2
 fi
 
 # Fail-before against d5e7ce4 for the new allowlist cases.
@@ -433,6 +477,16 @@ if [ -d "$SNAP_HOOKS" ] && [ -f "$SNAP_HOOKS/dispatch-bash.sh" ]; then
   done
 fi
 
+# #1489 review regressions. Do not apply these to the historical #1459 proof.
+add_merge 'F1.1 echo then quoted API' "echo checking; gh api -X PUT 'repos/me2resh/apexyard/pulls/1497/merge' -f merge_method=squash"
+add_merge 'F1.2 grep then quoted API' 'grep -q ok status.txt && gh api --method PUT "repos/o/r/pulls/7/merge"'
+add_merge 'F1.3 quoted API then echo line' $'gh api -X PUT "repos/o/r/pulls/7/merge" -f merge_method=squash\necho merged'
+add_merge 'F1.4 cd API then echo line' $'cd /x && gh api -X PUT "repos/o/r/pulls/7/merge"\necho done'
+add_merge 'F2.1 rg preprocessor payload' "echo 'gh pr merge 7 --squash' > m.sh; rg --pre sh . m.sh"
+add_merge 'F2.2 git hook payload' "echo x; echo 'gh pr merge 7 --squash' > .git/hooks/pre-commit; git commit --allow-empty -m x"
+add_merge 'F2.3 git external diff payload' "echo '[diff]' >> .git/config; echo 'external = sh -c \"gh pr merge 7\" #' >> .git/config; git diff"
+add_merge 'sort compressor payload' "echo 'gh pr merge 7' > m.sh; sort --compress-program=./m.sh input.txt"
+
 setup_dispatch_sandbox "$TMP/cur_dispatch" "$HOOKS"
 n=1
 while [ -f "$MERGE_CASES_DIR/$n.label" ]; do
@@ -479,6 +533,13 @@ if [ -s "$errf" ]; then
 else
   echo "PASS [stderr backslash cmd]"; pass=$((pass + 1))
 fi
+
+# #1525: dispatcher must route executable merge bodies to the merge gates.
+setup_dispatch_sandbox "$TMP/merge-dispatch" "$HOOKS"
+check 'python subprocess merge heredoc routes' yes "$(dispatch_has_merge "$TMP/merge-dispatch" \
+  $'python3 - <<\'EOF\'\nimport subprocess\nsubprocess.run(["gh","pr","merge", PR, "--repo", R])\nEOF')"
+check 'bash merge heredoc routes' yes "$(dispatch_has_merge "$TMP/merge-dispatch" \
+  $'bash <<\'EOF\'\ngh pr merge $PR --repo $R\nEOF')"
 
 printf 'RESULT: %s passed, %s failed; fail-before proofs %s ok / %s missed\n' \
   "$pass" "$fail" "$fail_before_pass" "$fail_before_fail"

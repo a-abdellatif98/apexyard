@@ -114,10 +114,12 @@ _bdw_operators() {
 #     - yq -i / -Pi / --inplace
 #
 #   Embedded interpreters with inline source (-c / -e / -r)
-#     - python -c / -Bc '…' with write/open/touch/copy/rename keywords
+#     - python / python3 / python3.12 -c / -Bc '…' with write keywords
 #       (also conservatively gates -cB, which Python reads as -c with
-#       program text B — not as -c plus a bundled B flag)
-#     - python <<EOF / python - <<EOF (heredoc-fed)
+#       program text B — not as -c plus a bundled B flag). Option
+#       arguments that contain the letter c before -c still match (#1502).
+#     - python <<EOF / python - <<EOF (heredoc-fed), including versioned
+#       binaries (#1502)
 #     - node -e '…' with writeFile/appendFile/write keywords
 #     - node <<EOF (heredoc-fed, #153)
 #     - ruby -e '…' with File.write/open keywords
@@ -306,12 +308,18 @@ _bdw_match_redirection() {
 # Protects the force-clobber operators (`>|`, `>>|`) from being torn
 # apart by the bare-`|` split — a real bash tokenizer lexes them as ONE
 # operator, never as `>` followed by a separate pipe — via a
-# placeholder-and-restore step. Uses bash parameter-expansion
-# substitution, NOT sed, for the split itself: BSD sed (macOS's default,
-# non-GNU) does not honour `\n` in replacement text as a literal newline,
-# so a sed-based split would silently no-op on a stock Mac.
+# placeholder-and-restore step. The fast path is one awk pass (literal
+# newlines in replacement text on BSD and GNU; LC_ALL=C accepts invalid
+# UTF-8). On awk failure the correct-but-slow legacy path below runs.
 # ------------------------------------------------------------------------------
-_bdw_split_top_level() {
+
+# Correct-but-slow legacy path: bash parameter-expansion substitutions.
+# Used only when the awk splitter fails (tool exit non-zero). Same
+# algorithm as pre-#1555. Slow on huge input under bash 3.2, but preserves
+# real write targets — a synthetic `> .` rewrite would make every extracted
+# target `.` and let a migration-path write slip past
+# require-migration-ticket.sh (Rex, PR #1557).
+_bdw_split_top_level_legacy() {
   local cmd="$1"
   [ -z "$cmd" ] && return 0
 
@@ -332,6 +340,35 @@ _bdw_split_top_level() {
   split="${split//@@APEXYARD_CLOBBER@@/>|}"
 
   printf '%s\n' "$split"
+}
+
+_bdw_split_top_level() {
+  local cmd="$1"
+  [ -z "$cmd" ] && return 0
+
+  local split
+  # One external pass preserves the original substitution order, including
+  # collisions with literal placeholder text in the command. An added input
+  # newline and the output sentinel preserve every original trailing newline
+  # across both awk's records and Bash command substitution.
+  if split=$(printf '%s\n' "$cmd" | LC_ALL=C awk '
+      {
+        gsub(/>>\|/, "@@APEXYARD_CLOBBER_APPEND@@")
+        gsub(/>\|/, "@@APEXYARD_CLOBBER@@")
+        gsub(/&&/, "\n")
+        gsub(/\|\|/, "\n")
+        gsub(/;/, "\n")
+        gsub(/\|/, "\n")
+        gsub(/@@APEXYARD_CLOBBER_APPEND@@/, ">>|")
+        gsub(/@@APEXYARD_CLOBBER@@/, ">|")
+        printf "%s\n", $0
+      }
+    ' && printf '\001'); then
+    printf '%s' "${split%?}"
+  else
+    # Correct-but-slow legacy path, used only on tool failure.
+    _bdw_split_top_level_legacy "$cmd"
+  fi
 }
 
 # ------------------------------------------------------------------------------
@@ -364,12 +401,21 @@ _bdw_split_top_level() {
 # added to the alternation.
 # ------------------------------------------------------------------------------
 _bdw_match_redirection_any_segment() {
-  local cmd="$1" seg
+  local cmd="$1" seg _bdw_seg_read=0
   [ -z "$cmd" ] && return 1
+  # Bash 3.2 materialises a here-doc as a temp file. If that write fails
+  # (full disk, ulimit -f 0), the loop sees no segments and would report
+  # "no write" — a fail-open. Track whether read ran; if it never did,
+  # fail closed. Redirect the here-doc setup error so the success path
+  # stays silent on stderr (me2resh/apexyard#1502 Hakim A1 / PR #1496).
   while IFS= read -r seg; do
+    _bdw_seg_read=1
     [ -z "$seg" ] && continue
     _bdw_match_redirection "$seg" && return 0
-  done < <(_bdw_split_top_level "$cmd")
+  done 2>/dev/null <<BDW_SEGMENTS
+$(_bdw_split_top_level "$cmd")
+BDW_SEGMENTS
+  [ "$_bdw_seg_read" -eq 0 ] && return 0
   return 1
 }
 
@@ -442,16 +488,26 @@ _bdw_match_sed_inplace() {
 #   - Text after `;` in the same region, such as `sed -n 1p f; echo "5W on"`.
 _BDW_SED_WRITE_POS='([;{][[:space:]]*|['"'"'"][[:space:]]*|[/|#!$0-9,:@%][gpiIeMm0-9]*)[wW][[:space:]]+'
 
-# Echoes each sed region of COMMAND, one per line. The split uses bash
-# substitution, not sed, for the BSD reason given at _bdw_split_top_level.
+# Echoes each sed region of COMMAND, one per line.
 # It splits only on separators with a space on each side, because sed
 # scripts hold bare `;` and `|` (`p;w f`, `s|a|b|w f`).
 _bdw_sed_regions() {
   local s="$1"
-  s="${s// && /$'\n'}"
-  s="${s// || /$'\n'}"
-  s="${s// | /$'\n'}"
-  printf '%s\n' "$s" | grep -oE '\bsed\b.*'
+  local regions
+  if regions=$(printf '%s\n' "$s" | LC_ALL=C awk '
+      {
+        gsub(/ && /, "\n")
+        gsub(/ \|\| /, "\n")
+        gsub(/ \| /, "\n")
+        printf "%s\n", $0
+      }
+    ' && printf '\001'); then
+    printf '%s' "${regions%?}" | grep -oE '\bsed\b.*'
+  else
+    # Keeping the unsplit text exposes every sed region to the matcher;
+    # it may match more text, but cannot discard a later sed write.
+    printf '%s\n' "$s" | grep -oE '\bsed\b.*'
+  fi
 }
 
 _bdw_match_sed_write() {
@@ -637,27 +693,33 @@ _bdw_match_yq_inplace() {
 # read, because the leading `[wax+]` still has to match.
 _BDW_PY_MODE="\\\\?['\"][rbtU]*[wax+][rwxabt+U]*([:|][a-z0-9*]*)?\\\\?['\"]"
 
-# python -c presence (#1480 + review fix).
+# python -c presence (#1480, tightened in #1502).
 #
-# Legacy (dev) form: `(-[^c]*[[:space:]]+)?-c\b` after python. `[^c]*` may span
-# spaces, so an option argument such as `ignore` in `python3 -W ignore -c`
-# still reaches `-c`. Keep this form so the new detector is never looser than
-# dev for any input.
+# Interpreter token: `python`, `python3`, `python3.12`, `python2.7`, and the
+# same with a trailing patch segment (`python3.12.1`). The prior `python3?`
+# form matched only `python` / `python3` and missed every versioned binary
+# (me2resh/apexyard#1502 case 1, review of PR #1485).
+_BDW_PYTHON_BIN='\bpython[0-9]*(\.[0-9]+)*'
+
+# -c / -Bc / -cB after the interpreter. Intervening options AND their
+# arguments may contain the letter c — `python3 -W error::ResourceWarning -c`
+# and `python3 -X pycache_prefix=/x -c` are real writes that the #1480
+# `[^c]*` / `[^c[:space:]]*` skippers missed (me2resh/apexyard#1502 case 2).
+# `[^|;&]*` may span those arguments freely. The optional group ends on a
+# space so the final `-[A-Za-z0-9]*c…` still sees a flag token.
+#
+# This form covers the #1480 cases (`-W ignore -c`, `-Bc`, `-B -c`,
+# bare `-c`, `-cB`) and the #1502 cases. Long options such as `--check` do not
+# match the final short-flag class. `-cB` stays gated: Python reads it as
+# `-c` with program text `B`.
+_BDW_PYTHON_DASH_C_NEW_RE="${_BDW_PYTHON_BIN}[[:space:]]+([^|;&]*[[:space:]])?-[A-Za-z0-9]*c[A-Za-z0-9]*\b"
+
+# The two #1480 forms stay in the alternation unchanged. The legacy `[^c]*`
+# skipper can span `|`, `;` and `&`, which the new form does not, so the
+# union keeps this detector from matching less than dev for any input.
 _BDW_PYTHON_DASH_C_LEGACY_RE='\bpython3?[[:space:]]+(-[^c]*[[:space:]]+)?-c\b'
-
-# Bundled shorts (#1480): a lone `-c`, bundled shorts that include `c` (`-Bc`),
-# and preceding short flags that do not contain `c` (`-B -c`, `-OO -c`). Each
-# skipped token must start with `-`, so this form alone misses
-# `python3 -W ignore -c`. Long options such as `--check` do not match: a
-# second leading dash fails the short-option class.
-#
-# `-cB` is also matched here. Python reads that as `-c` with program text `B`
-# (not as `-c` plus a bundled `B` flag). Detection stays conservative and
-# continues to gate it.
 _BDW_PYTHON_DASH_C_BUNDLED_RE='\bpython3?[[:space:]]+(-[^c[:space:]]*[[:space:]]+)*-[A-Za-z0-9]*c[A-Za-z0-9]*\b'
-
-# Match when EITHER form matches. Apply at every presence check.
-_BDW_PYTHON_DASH_C_RE="(${_BDW_PYTHON_DASH_C_LEGACY_RE}|${_BDW_PYTHON_DASH_C_BUNDLED_RE})"
+_BDW_PYTHON_DASH_C_RE="(${_BDW_PYTHON_DASH_C_NEW_RE}|${_BDW_PYTHON_DASH_C_LEGACY_RE}|${_BDW_PYTHON_DASH_C_BUNDLED_RE})"
 
 # A call whose arguments after the first comma contain NO quote at all has no
 # literal mode to read, so the mode is unknown and the call counts as a write.
@@ -718,9 +780,10 @@ _bdw_match_python_dash_c() {
 }
 
 # 10. Heredoc-fed Python. Extended in #153 for the same keyword list.
+#     Versioned binaries (#1502) share _BDW_PYTHON_BIN with the -c matcher.
 _bdw_match_python_heredoc() {
   local cmd="$1"
-  echo "$cmd" | grep -qE '\bpython3?[[:space:]]+(-[[:space:]]+)?<<' || return 1
+  echo "$cmd" | grep -qE "${_BDW_PYTHON_BIN}[[:space:]]+(-[[:space:]]+)?<<" || return 1
   echo "$cmd" | grep -qE "$_BDW_PYTHON_WRITE_RE"
 }
 
@@ -847,7 +910,7 @@ _bdw_quoted_source_write() {
   if printf '%s' "$syntax" | grep -qE "$_BDW_PYTHON_DASH_C_RE"; then
     _bdw_match_python_dash_c "$raw" && return 0
   fi
-  if printf '%s' "$syntax" | grep -qE '\bpython3?[[:space:]]+(-[[:space:]]+)?<<'; then
+  if printf '%s' "$syntax" | grep -qE "${_BDW_PYTHON_BIN}[[:space:]]+(-[[:space:]]+)?<<"; then
     _bdw_match_python_heredoc "$raw" && return 0
   fi
   if printf '%s' "$syntax" | grep -qE '\bnode[[:space:]]+(-[^e]*[[:space:]]+)?-e\b'; then
@@ -1220,7 +1283,9 @@ _bdw_targets_from_segment() {
     [ -z "$line" ] && continue
     target=$(printf '%s\n' "$line" | sed -E "$_BDW_REDIRECT_STRIP")
     [ -n "$target" ] && _bdw_strip_quotes "$target"
-  done < <(printf '%s\n' "$seg" | grep -oE "$_BDW_REDIRECT_RE")
+  done 2>/dev/null <<BDW_REDIRECTS
+$(printf '%s\n' "$seg" | grep -oE "$_BDW_REDIRECT_RE")
+BDW_REDIRECTS
 
   _bdw_cp_mv_target_before_redirect "$seg" "$syntax"
 
@@ -1285,7 +1350,10 @@ _bdw_targets_from_segment() {
 # begin" and can't drift apart again.
 # ------------------------------------------------------------------------------
 bash_extract_write_targets() {
-  local raw="$1" cmd sed_cmd syntax
+  # $2 = "all": always emit sed `w` targets, never hold them back. The
+  # migration gate passes it, because it exits 0 on an empty list and so
+  # needs every named target (#1502, review of PR #1516).
+  local raw="$1" mode="${2:-}" cmd sed_cmd syntax
   local -a syntax_segments=()
   [ -z "$raw" ] && return 0
   bash_command_appears_to_write "$raw" || return 0
@@ -1296,20 +1364,29 @@ bash_extract_write_targets() {
     sed_cmd="$raw"
   fi
 
-  local seg
+  local seg _bdw_syn_read=0
   while IFS= read -r seg; do
+    _bdw_syn_read=1
     syntax_segments+=("$seg")
-  done < <(_bdw_split_top_level "$syntax")
-
-  local seg_targets
-  seg_targets=$(
+  # 2>/dev/null silences only the here-doc setup error on this loop; the
+  # loop body only appends to an array and writes nothing to stderr.
+  done 2>/dev/null <<BDW_SYNTAX_SEGMENTS
+$(_bdw_split_top_level "$syntax")
+BDW_SYNTAX_SEGMENTS
+  # Here-doc failed: the segment pass cannot name targets. Skip it, but
+  # still reach the sed `w` block below, which reads no here-doc. A caller
+  # that already saw a write fails closed on the list it gets (#1502).
+  local seg_targets=""
+  [ "$_bdw_syn_read" -eq 1 ] && seg_targets=$(
     local index=0
     while IFS= read -r seg; do
       local syntax_seg="${syntax_segments[index]:-}"
       index=$((index + 1))
       [ -z "$seg" ] && continue
       _bdw_targets_from_segment "$seg" "$syntax_seg"
-    done < <(_bdw_split_top_level "$cmd")
+    done 2>/dev/null <<BDW_COMMAND_SEGMENTS
+$(_bdw_split_top_level "$cmd")
+BDW_COMMAND_SEGMENTS
   )
   {
     [ -n "$seg_targets" ] && printf '%s\n' "$seg_targets"
@@ -1321,8 +1398,8 @@ bash_extract_write_targets() {
     # and another write family fired. Then require-active-ticket.sh sees
     # an empty list and fails closed, as it did before #1414. A lone `w`
     # target such as `/dev/stdout` is exempt, and it would turn that closed
-    # gate into a pass. require-migration-ticket.sh exits 0 on an empty
-    # list, so it does not judge a held-back `w` file, as on dev. Examples
+    # gate into a pass. require-migration-ticket.sh passes "all", so it
+    # always judges the `w` files (#1502). Examples
     # that stay blocked by the ticket gate this way:
     #   sed -i "s/a/b/w /dev/stdout" src/app.ts
     #   awk -i inplace 1 src/app.ts; sed -n 'w /tmp/x' in.txt
@@ -1330,7 +1407,7 @@ bash_extract_write_targets() {
     # When the list is not empty, the `w` targets are added. An extra
     # target can only add a reason to block, because the gate requires
     # every target to pass.
-    if [ -n "$seg_targets" ] || ! _bdw_detects_other_write "$cmd"; then
+    if [ "$mode" = all ] || [ -n "$seg_targets" ] || ! _bdw_detects_other_write "$cmd"; then
       _bdw_sed_write_targets "$sed_cmd"
     fi
   } | awk '!seen[$0]++' | {
@@ -1368,12 +1445,22 @@ bash_command_has_unextractable_write() {
     yq_target=$(bash_extract_write_target "$syntax")
     printf '%s' "$yq_target" | grep -qE '^[A-Za-z0-9./_~-]+$' || return 0
   fi
+  local _bdw_syn_read=0 _bdw_op_read=0
   while IFS= read -r segment; do
+    _bdw_syn_read=1
     syntax_segments+=("$segment")
-  done < <(_bdw_split_top_level "$syntax")
+  done 2>/dev/null <<BDW_SYNTAX_SEGMENTS
+$(_bdw_split_top_level "$syntax")
+BDW_SYNTAX_SEGMENTS
+  # Here-doc failed: cannot decide extractability. Fail closed (#1502).
+  [ "$_bdw_syn_read" -eq 0 ] && return 0
   while IFS= read -r segment; do
+    _bdw_op_read=1
     operator_segments+=("$segment")
-  done < <(_bdw_split_top_level "$operators")
+  done 2>/dev/null <<BDW_OPERATOR_SEGMENTS
+$(_bdw_split_top_level "$operators")
+BDW_OPERATOR_SEGMENTS
+  [ "$_bdw_op_read" -eq 0 ] && return 0
   [ "${#syntax_segments[@]}" -eq "${#operator_segments[@]}" ] || return 0
   for ((index=0; index<${#syntax_segments[@]}; index++)); do
     if printf '%s' "${syntax_segments[index]}" | grep -qE '(^|[;&|()[:space:]])(cp|mv)[[:space:]]' \
@@ -1395,7 +1482,7 @@ bash_command_has_unextractable_write() {
   _bdw_quoted_source_write "$syntax" "$raw" || return 1
   # sed w with a named target is handled above; the remaining matches are
   # inline programs and heredoc-fed interpreters with unknown destinations.
-  if printf '%s' "$syntax" | grep -qE '\b(python3?|node|ruby|perl|php)[[:space:]]'; then
+  if printf '%s' "$syntax" | grep -qE "${_BDW_PYTHON_BIN}[[:space:]]|\b(node|ruby|perl|php)[[:space:]]"; then
     return 0
   fi
   return 1

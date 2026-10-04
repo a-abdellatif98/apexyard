@@ -17,6 +17,11 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 # Pin isolation: per-project tracker resolution (#670) reads the ops-root
 # session pin to find the registry. Run interactively inside a live apexyard
 # session, the pin resolves PAST each mktemp sandbox to the operator's real
@@ -70,6 +75,7 @@ YAML
     cp "$TRACKER_LIB"   .claude/hooks/_lib-tracker.sh
     cp "$CONFIG_LIB"    .claude/hooks/_lib-read-config.sh
     cp "$PR_CREATE_HOOK"   .claude/hooks/validate-pr-create.sh
+    cp "$(dirname "$PR_CREATE_HOOK")/_lib-review-markers.sh" .claude/hooks/
     cp "$COMMIT_REFS_HOOK" .claude/hooks/verify-commit-refs.sh
     cp "$BRANCH_NAME_HOOK" .claude/hooks/validate-branch-name.sh
     chmod +x .claude/hooks/*.sh
@@ -178,6 +184,9 @@ fi
 exit 0
 '
 cmd='gh pr create --title "feat(#42): add csv export" --body "
+## Summary
+Sample change.
+
 ## Testing
 verify
 
@@ -185,6 +194,7 @@ verify
 | Term | Definition |
 |------|------------|
 | CSV | Comma-separated values |
+Refs #1
 " --head feature/GH-1-test'
 if run_pr_hook "$SB" "$cmd" 0; then
   record_pass "regression: default gh adopter — valid PR title passes"
@@ -206,6 +216,9 @@ fi
 exit 0
 '
 cmd='gh pr create --title "feat(#9999): missing ticket" --body "
+## Summary
+Sample change.
+
 ## Testing
 x
 
@@ -213,6 +226,7 @@ x
 | Term | Definition |
 |------|------------|
 | x | x |
+Refs #1
 " --head feature/GH-1-test'
 if run_pr_hook "$SB" "$cmd" 2; then
   record_pass "regression: default gh adopter — fabricated #N blocks"
@@ -246,6 +260,9 @@ exit 0
 '
 # Linear: no --repo flag in command; PR is still gh-shaped (gh pr create).
 cmd='gh pr create --title "feat(LIN-42): linear ticket" --body "
+## Summary
+Sample change.
+
 ## Testing
 x
 
@@ -253,6 +270,7 @@ x
 | Term | Definition |
 |------|------------|
 | LIN | Linear |
+Refs #1
 " --head feature/LIN-42-test'
 if run_pr_hook "$SB" "$cmd" 0; then
   record_pass "linear: end-to-end — valid LIN-42 PR title passes via mock linear CLI"
@@ -269,6 +287,9 @@ fi
 exit 0
 '
 cmd='gh pr create --title "feat(LIN-50): linear closed" --body "
+## Summary
+Sample change.
+
 ## Testing
 x
 
@@ -276,6 +297,7 @@ x
 | Term | Definition |
 |------|------------|
 | LIN | Linear |
+Refs #1
 " --head feature/LIN-50-test'
 if run_pr_hook "$SB" "$cmd" 2; then
   record_pass "linear: closed-state (Done) → blocked"
@@ -293,6 +315,9 @@ fi
 # gh fabricated #N still blocks — see Case 12.)
 install_mock "$SB" linear 'exit 1'
 cmd='gh pr create --title "feat(LIN-99): unqueryable" --body "
+## Summary
+Sample change.
+
 ## Testing
 x
 
@@ -300,6 +325,7 @@ x
 | Term | Definition |
 |------|------------|
 | LIN | Linear |
+Refs #1
 " --head feature/LIN-99-test'
 if run_pr_hook "$SB" "$cmd" 0; then
   record_pass "linear: tracker CLI returns empty → shape-only PASS (#501; was block pre-#501)"
@@ -331,6 +357,9 @@ fi
 exit 0
 '
 cmd='gh pr create --title "feat(JIRA-100): jira ticket" --body "
+## Summary
+Sample change.
+
 ## Testing
 x
 
@@ -338,6 +367,7 @@ x
 | Term | Definition |
 |------|------------|
 | JIRA | Atlassian Jira |
+Refs #1
 " --head feature/JIRA-100-test'
 if run_pr_hook "$SB" "$cmd" 0; then
   record_pass "jira: end-to-end — valid JIRA-100 PR title passes via mock jira CLI"
@@ -354,6 +384,9 @@ fi
 exit 0
 '
 cmd='gh pr create --title "feat(JIRA-200): jira closed" --body "
+## Summary
+Sample change.
+
 ## Testing
 x
 
@@ -361,6 +394,7 @@ x
 | Term | Definition |
 |------|------------|
 | JIRA | Atlassian Jira |
+Refs #1
 " --head feature/JIRA-200-test'
 if run_pr_hook "$SB" "$cmd" 2; then
   record_pass "jira: closed-state (Resolved) → blocked"
@@ -389,6 +423,9 @@ JSON
 install_mock "$SB" gh 'exit 99'
 
 cmd='gh pr create --title "feat(#99999): no-tracker mode" --body "
+## Summary
+Sample change.
+
 ## Testing
 x
 
@@ -396,6 +433,7 @@ x
 | Term | Definition |
 |------|------------|
 | x | x |
+Refs #1
 " --head feature/GH-99999-test'
 if run_pr_hook "$SB" "$cmd" 0; then
   record_pass "none: existence check short-circuited (no CLI call made)"
@@ -436,6 +474,9 @@ printf "{\"state\":\"open\",\"title\":\"mock %s\",\"url\":\"https://my/%s\",\"la
 exit 0
 '
 cmd='gh pr create --title "feat(TIC-7): custom" --body "
+## Summary
+Sample change.
+
 ## Testing
 x
 
@@ -443,6 +484,7 @@ x
 | Term | Definition |
 |------|------------|
 | TIC | Custom tracker |
+Refs #1
 " --head feature/TIC-7-test'
 if run_pr_hook "$SB" "$cmd" 0; then
   record_pass "custom: end-to-end — operator-supplied command works"
@@ -789,6 +831,9 @@ JSON
 # queryable from this environment) — tracker_view returns empty.
 install_mock "$SB" linear 'exit 1'
 cmd='gh pr create --title "feat(LIN-77): real linear ticket" --body "
+## Summary
+Sample change.
+
 ## Testing
 x
 
@@ -796,6 +841,7 @@ x
 | Term | Definition |
 |------|------------|
 | LIN | Linear |
+Refs #1
 " --head feature/LIN-77-test'
 if run_pr_hook "$SB" "$cmd" 0; then
   record_pass "#501 pr-create: non-gh tracker not queryable → shape-only PASS (no block)"
@@ -834,6 +880,9 @@ JSON
 install_mock "$SB" linear 'exit 1'
 # Malformed title: no ticket ref in the type(TICKET): shape → must block (exit 2).
 cmd='gh pr create --title "feat: missing ticket parens" --body "
+## Summary
+Sample change.
+
 ## Testing
 x
 
@@ -841,6 +890,7 @@ x
 | Term | Definition |
 |------|------------|
 | x | x |
+Refs #1
 " --head feature/LIN-1-test'
 if run_pr_hook "$SB" "$cmd" 2; then
   record_pass "#501 pr-create: ill-formed title still fails shape check under non-gh tracker"
@@ -864,6 +914,9 @@ fi
 exit 0
 '
 cmd='gh pr create --title "feat(#88888): missing gh ticket" --body "
+## Summary
+Sample change.
+
 ## Testing
 x
 
@@ -871,6 +924,7 @@ x
 | Term | Definition |
 |------|------------|
 | x | x |
+Refs #1
 " --head feature/GH-1-test'
 if run_pr_hook "$SB" "$cmd" 2; then
   record_pass "#501 pr-create: gh tracker fabricated #N still BLOCKS (gh behaviour unchanged)"

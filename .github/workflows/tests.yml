@@ -19,8 +19,19 @@ concurrency:
 
 jobs:
   hook-tests:
-    name: hook test suite
-    runs-on: ubuntu-latest
+    name: hook tests (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux jq-1.7
+          - os: ubuntu-latest
+            label: linux jq-1.8
+          - os: macos-latest
+            label: macos bash-3.2
     steps:
       - name: Checkout
         with:
@@ -28,7 +39,22 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install jq (used by the hooks + their tests)
+        if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y -qq jq
+
+      - name: Install jq 1.8.2
+        if: matrix.label == 'linux jq-1.8'
+        run: |
+          jq_bin="$RUNNER_TEMP/jq-1.8-bin"
+          mkdir -p "$jq_bin"
+          curl --fail --location --silent --show-error \
+            https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-amd64 \
+            --output "$jq_bin/jq"
+          echo "b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f  $jq_bin/jq" | sha256sum -c -
+          chmod +x "$jq_bin/jq"
+          echo "$jq_bin" >> "$GITHUB_PATH"
+          export PATH="$jq_bin:$PATH"
+          test "$(jq --version)" = jq-1.8.2
 
       - name: Configure git identity (test sandboxes run git init/commit)
         run: |
@@ -37,4 +63,59 @@ jobs:
           git config --global init.defaultBranch main
 
       - name: Run the hook test suite
-        run: bash bin/run-hook-tests.sh
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            # Override only bash and jq. Putting /usr/bin first on PATH would
+            # also select Apple's Python 3.9, which has no tomllib, and the
+            # dependency-audit helper needs Python 3.11+ (#1561).
+            stock_bin="$RUNNER_TEMP/stock-macos-bin"
+            mkdir -p "$stock_bin"
+            ln -sf /bin/bash "$stock_bin/bash"
+            ln -sf /usr/bin/jq "$stock_bin/jq"
+            export PATH="$stock_bin:$PATH"
+          fi
+          jq --version
+          command -v jq
+          bash --version | head -1
+          /bin/bash --version | head -1
+          python3 --version
+          if [ "$RUNNER_OS" = macOS ]; then
+            test "$(readlink "$(command -v jq)")" = /usr/bin/jq
+            test "$(readlink "$(command -v bash)")" = /bin/bash
+            [[ "$(/bin/bash --version | head -1)" == *"version 3.2."* ]]
+            python3 -c 'import tomllib'
+          fi
+          snapshot_repo=$(mktemp -d)
+          trap 'rm -rf "$snapshot_repo"' EXIT
+          git -C "$snapshot_repo" init -q --bare
+          git -C "$snapshot_repo" fetch -q --no-tags \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" \
+            refs/pull/1466/head:refs/heads/reviewed-snapshots
+          # Pin full 40-character SHAs for the reviewed command-scrub snapshots
+          # (PR #1466). Short SHAs can become ambiguous as history grows.
+          # Verify each commit after the fetch so a missing object fails clearly.
+          for sha in \
+            39c5b959f0544785c643c6945b487ec579b4a035 \
+            d5e7ce4d50e07bd0bd026230e1fb78714e809a27 \
+            1fea7308d0a6de4412198b1bc645ada8a47a8f05
+          do
+            if ! git -C "$snapshot_repo" cat-file -e "${sha}^{commit}" 2>/dev/null; then
+              echo "CI snapshot proof failed: commit ${sha} is not present after fetching refs/pull/1466/head" >&2
+              exit 1
+            fi
+          done
+          APEXYARD_SNAPSHOT_REPO="$snapshot_repo" REQUIRE_SNAPSHOTS=1 \
+            /bin/bash bin/run-hook-tests.sh
+
+  # The dev ruleset requires "hook test suite". Matrix jobs have distinct names.
+  # This final job fails unless every leg passes, preserving the required check.
+  hook-test-suite:
+    name: hook test suite
+    needs: [hook-tests]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every matrix leg to pass
+        env:
+          MATRIX_RESULT: ${{ needs.hook-tests.result }}
+        run: test "$MATRIX_RESULT" = success

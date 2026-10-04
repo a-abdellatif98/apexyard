@@ -36,6 +36,11 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 REPO_ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 AGDR_HOOK="$REPO_ROOT/.claude/hooks/require-agdr-for-arch-pr.sh"
 PRC_HOOK="$REPO_ROOT/.claude/hooks/validate-pr-create.sh"
@@ -193,6 +198,7 @@ make_sandbox() {
   )
   mkdir -p "$sb/.claude/hooks"
   cp "$PRC_HOOK" "$sb/.claude/hooks/validate-pr-create.sh"
+  cp "$(dirname "$PRC_HOOK")/_lib-review-markers.sh" "$sb/.claude/hooks/"
   chmod +x "$sb/.claude/hooks/validate-pr-create.sh"
   cp "$SRC_ROOT/.claude/hooks/_lib-read-config.sh" "$sb/.claude/hooks/_lib-read-config.sh"
   [ -f "$SRC_ROOT/.claude/hooks/_lib-tracker.sh" ] && \
@@ -240,6 +246,8 @@ FULL_BODY='## Summary
 | Term | Definition |
 |------|------------|
 | thing | a thing |
+
+Refs #1041
 '
 
 THIN_BODY='## Summary

@@ -33,6 +33,11 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 SRC_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 HOOK_SRC="$SRC_ROOT/.claude/hooks/validate-pr-create.sh"
 LIB_CFG="$SRC_ROOT/.claude/hooks/_lib-read-config.sh"
@@ -72,6 +77,7 @@ make_sandbox() {
   )
   mkdir -p "$sb/.claude/hooks"
   cp "$HOOK_SRC" "$sb/.claude/hooks/validate-pr-create.sh"
+  cp "$(dirname "$HOOK_SRC")/_lib-review-markers.sh" "$sb/.claude/hooks/"
   chmod +x "$sb/.claude/hooks/validate-pr-create.sh"
   [ -f "$LIB_CFG" ]     && cp "$LIB_CFG"     "$sb/.claude/hooks/_lib-read-config.sh"
   [ -f "$LIB_TRACKER" ] && cp "$LIB_TRACKER" "$sb/.claude/hooks/_lib-tracker.sh"
@@ -144,7 +150,9 @@ test
 ## Glossary
 | Term | Definition |
 |------|------------|
-| GH-900 | gate anchor fix |"
+| GH-900 | gate anchor fix |
+
+Refs #900"
 BF_OK=$(mktemp /tmp/test-gate-anchor-ok.XXXXXX.md)
 printf '%s' "$BODY_OK" > "$BF_OK"
 
