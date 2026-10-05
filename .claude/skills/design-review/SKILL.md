@@ -10,7 +10,10 @@ allowed-tools: Bash, Read, Grep, Glob
 
 Read .claude/rules/writing-standard.md before you write a review.
 Use the controlled technical writing profile for the architecture review.
-If the artifact fails the profile, you must request changes.
+Treat a profile fault in the design artifact as advisory, with the failed
+rule named and a clear replacement shown. Request changes only when the
+fault changes meaning or drops evidence — that fault is a correctness
+finding, not a style nit.
 State the verdict and next action first. State evidence after the verdict.
 
 Review a **design artifact** — a technical design doc, a migration AgDR, or a feature spec / PRD — for architectural soundness before any code is built against it. This is the non-code analog of `/code-review`: where Rex reviews a code PR, **Tariq (the Solution Architect)** reviews the design.
@@ -35,11 +38,17 @@ See [`.claude/rules/role-triggers.md`](../../rules/role-triggers.md) for the ful
 /design-review docs/designs/checkout.md   # doc-only review (no PR yet)
 ```
 
+## Running tests in a scratch clone
+
+Tariq may need to run tests or attack probes against the PR head, outside this repository's working tree. Use a plain `git clone` into a literal scratch path. Or export the PR head with `git archive | tar -x` into a literal non-git directory. The export step still needs an active session ticket. A later write to a literal path inside that directory can use the me2resh/apexyard#883 exemption. If a hook blocks a command, stop that step. Report the exact command, the hook, and its message to the orchestrator. Never rephrase, split, encode, or disguise a command to get past a hook. Full pattern: `.claude/agents/solution-architect.md` § "Running tests in a scratch clone".
+
+The reviewer mutation lock blocks `git clone`, `git fetch`, and `git checkout` while the active-reviewer marker exists. Prepare the scratch clone and fetch the PR head before step 0 arms the marker.
+
 ## Process
 
 ### 0. Write the active-reviewer marker (REQUIRED — me2resh/apexyard#843, when reviewing a PR)
 
-Before spawning the Solution Architect agent (Tariq) for a PR review, write the active-reviewer session marker. It records that this review pass is the sanctioned one and suppresses `warn-review-marker-write.sh`'s advisory warning on the `*-architecture.approved` write (same convention as `/code-review`'s rex marker; that hook warns and never blocks since #1026 — AgDR-0111). Use the SAME resolved `owner/repo` from step 1 (below) — the sibling-repo resolution in split-portfolio v2 matters here too. At skill entry:
+Before spawning the Solution Architect agent (Tariq) for a PR review, write the active-reviewer session marker. It records that this review pass is the sanctioned one and suppresses `warn-review-marker-write.sh`'s advisory warning on the `*-architecture.approved` write (same convention as `/code-review`'s rex marker; that hook warns and never blocks since #1026 — AgDR-0111). The marker is scoped to THIS Claude Code session (me2resh/apexyard#1376) — resolve its path through `active_reviewer_marker_path`, never write the bare `.claude/session/active-reviewer` path directly. Use the SAME resolved `owner/repo` from step 1 (below) — the sibling-repo resolution in split-portfolio v2 matters here too. At skill entry:
 
 ```bash
 ops_root=$(git rev-parse --show-toplevel)
@@ -49,14 +58,25 @@ while [ -n "$r" ] && [ "$r" != "/" ]; do
   [ -f "$r/onboarding.yaml" ] && [ -f "$r/apexyard.projects.yaml" ] && { ops_root="$r"; break; }
   r=$(dirname "$r")
 done
-mkdir -p "$ops_root/.claude/session"
-printf '%s\n' "<owner/repo>#<pr>:architecture" > "$ops_root/.claude/session/active-reviewer"
+. "$ops_root/.claude/hooks/_lib-review-markers.sh"
+active_marker=$(active_reviewer_marker_path "$ops_root")
+mkdir -p "$(dirname "$active_marker")"
+printf '%s\n' "<owner/repo>#<pr>:architecture" > "$active_marker"
 ```
 
-On skill exit (after the review is posted, whether or not the marker gets written), clear it:
+On skill exit (after the review is posted, whether or not the marker gets written), clear it. Shell variables do not persist across separate Bash tool calls, so the exit step re-resolves `ops_root` and `active_marker` from scratch — it does not reuse the step-0 variable, which would silently be empty in a later call and turn the `rm -f` into a no-op:
 
 ```bash
-rm -f "$ops_root/.claude/session/active-reviewer"
+ops_root=$(git rev-parse --show-toplevel)
+r="$ops_root"
+while [ -n "$r" ] && [ "$r" != "/" ]; do
+  [ -f "$r/.apexyard-fork" ] && { ops_root="$r"; break; }
+  [ -f "$r/onboarding.yaml" ] && [ -f "$r/apexyard.projects.yaml" ] && { ops_root="$r"; break; }
+  r=$(dirname "$r")
+done
+. "$ops_root/.claude/hooks/_lib-review-markers.sh"
+active_marker=$(active_reviewer_marker_path "$ops_root")
+rm -f "$active_marker"
 ```
 
 Doc-only reviews (no PR yet) never write a marker, so this step is a no-op for them. Nothing mechanically stops a build-class sub-agent writing the same file; what makes this marker legitimate is that a real, independent review happened. See `.claude/hooks/warn-review-marker-write.sh` and `.claude/rules/pr-workflow.md` § "Build agents cannot self-review".

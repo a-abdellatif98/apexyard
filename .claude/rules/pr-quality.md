@@ -8,6 +8,29 @@ Use active voice. State one fact or action in each sentence. Lead with the
 outcome and next action. Keep uncertainty, evidence, and identifiers. Remove
 empty and process-only sections.
 
+## Builder Evidence (MANDATORY, me2resh/apexyard#1418)
+
+The builder pastes test evidence into the PR body. Do this before requesting
+review, so the reviewer can spot-check the evidence instead of reproducing
+every command.
+
+Run, and paste the commands and their results into a `## Testing` section:
+
+1. Shellcheck on every changed shell script.
+2. The tests for every changed file.
+3. A fail-before proof for each new test — run the new test against the
+   pre-change code and confirm it fails, then against the changed code and
+   confirm it passes.
+
+The reviewer spot-checks this evidence and does not reproduce all of it.
+Missing or implausible evidence is advisory on its own. The reviewer runs
+the check itself before treating it as a finding, and a check that fails
+on that run is a correctness finding under
+`.claude/agents/code-reviewer.md` § "Blocking-Severity Bar".
+
+A docs-only PR with no tests to run needs no test evidence. State that in
+the `## Testing` section instead of leaving it empty.
+
 ## Glossary (MANDATORY)
 
 Every PR description **must** include a Glossary section:

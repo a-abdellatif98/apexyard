@@ -9,7 +9,7 @@ set -u
 
 SRC_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 RULE_FILE="$SRC_ROOT/.claude/rules/right-size-ceremony.md"
-CASES_FILE="$SRC_ROOT/.claude/rules/tests/fixtures/proportionate-work-cases.md"
+CASES_FILE="$SRC_ROOT/docs/quality-regression/fixtures/proportionate-work-cases.md"
 AGDR_FILE="$SRC_ROOT/docs/agdr/AgDR-0125-proportionate-work-extends-right-size-tiers.md"
 
 PASS=0
@@ -45,7 +45,8 @@ assert "rule:agdr-not-skipped" grep -qF 'material at any diff size' "$RULE_FILE"
 assert "rule:self-check-smallest" grep -qF 'smallest change that meets every acceptance criterion' "$RULE_FILE"
 assert "rule:advisory-honesty" grep -qF 'It does not score model behavior' "$RULE_FILE"
 
-assert "wiring:claude" grep -qF '@.claude/rules/right-size-ceremony.md' "$SRC_ROOT/CLAUDE.md"
+assert "wiring:claude" grep -qF '.claude/rules/right-size-ceremony.md' "$SRC_ROOT/CLAUDE.md"
+assert "wiring:claude-no-at-import" bash -c "! grep -qF '@.claude/rules/right-size-ceremony.md' '$SRC_ROOT/CLAUDE.md'"
 assert "wiring:claude-extension" grep -qF 'smallest change that satisfies the acceptance criteria' "$SRC_ROOT/CLAUDE.md"
 assert "wiring:agents" grep -qF '.claude/rules/right-size-ceremony.md' "$SRC_ROOT/AGENTS.md"
 assert "wiring:system" grep -qF 'right-size-ceremony' "$SRC_ROOT/SYSTEM.md"

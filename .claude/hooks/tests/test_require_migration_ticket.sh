@@ -439,6 +439,47 @@ fi
 rm -rf "$SB"
 
 # =============================================================================
+# me2resh/apexyard#1368 — Alembic tooling files (env.py, script.py.mako) are
+# NOT migrations: pass-through (allow, no tracker call), even with no active
+# ticket at all — same shape as Case 10's non-migration-path check.
+# =============================================================================
+for ALEMBIC_TOOLING_PATH in \
+  "alembic/env.py" \
+  "alembic/script.py.mako" \
+  "db/migrations/env.py" \
+  "db/migrations/script.py.mako"
+do
+  SB=$(make_fork)
+  install_mock "$SB" gh 'exit 99'
+  if run_hook "$SB" "$SB/$ALEMBIC_TOOLING_PATH" 0; then
+    record_pass "#1368 Alembic tooling ($ALEMBIC_TOOLING_PATH) → pass-through allow, no ticket needed"
+  else
+    record_fail "#1368 Alembic tooling ($ALEMBIC_TOOLING_PATH) → pass-through allow, no ticket needed"
+  fi
+  rm -rf "$SB"
+done
+
+# =============================================================================
+# me2resh/apexyard#1368 negative controls — real revision scripts must still
+# be gated: no active ticket → block (Gate 1), same as any other migration
+# path. Proves the tooling exemption above did not weaken detection of
+# alembic/versions/*.py or the generic migrations/* catch-all.
+# =============================================================================
+for REAL_MIGRATION_PATH in \
+  "alembic/versions/0001_add_users.py" \
+  "db/migrations/0001_add_users.py"
+do
+  SB=$(make_fork)
+  install_mock "$SB" gh 'exit 99'
+  if run_hook "$SB" "$SB/$REAL_MIGRATION_PATH" 2; then
+    record_pass "#1368 control: real revision script ($REAL_MIGRATION_PATH) still requires a ticket → block"
+  else
+    record_fail "#1368 control: real revision script ($REAL_MIGRATION_PATH) still requires a ticket → block"
+  fi
+  rm -rf "$SB"
+done
+
+# =============================================================================
 # Case 12: jira happy path (#761). Body is now mapped for jira, so an OPEN,
 # migration-labelled ticket whose ADF description (Jira Cloud) links a migration
 # AgDR passes Gate 3 → allow (0). This replaces the pre-#761 case that asserted
@@ -1509,6 +1550,55 @@ else
   fi
   rm -f "$_parity_baseline"
 fi
+
+# =============================================================================
+# Cases 45-47 (H1, Hakim's security review on PR #1404). Cases 39-41 above
+# use the SAME fixture shape as cases 36-38: the ops marker (#42) is OPEN but
+# NOT migration-labelled, and the project's own marker (#99) IS. Both an
+# empty marker (fail-closed) and an approved-but-wrong ops marker exit 2
+# there, so cases 39-41 cannot tell "refused outright" from "fell through to
+# the wrong ticket and got refused for a DIFFERENT reason". This fixture
+# inverts which side is valid: the ops marker now carries a real migration
+# label + AgDR, and the project's own marker does not. If a tilde-spelled
+# write into the project's migrations/ ever fell through to the ops ticket,
+# THIS fixture would ALLOW it (rc=0) -- the #1159 wrong-ticket approval this
+# gate exists to refuse. Asserting the stderr text, not just rc=2, proves
+# the write was refused outright ("No active ticket set") rather than judged
+# against the ops ticket and refused for lacking the migration label.
+# =============================================================================
+mk_inverted_fixture() {   # echoes the sandbox path
+  local sb; sb=$(make_fork)
+  mkdir -p "$sb/workspace/example/migrations"
+  # Ops-level marker: OPEN, migration-labelled + AgDR -> would ALLOW.
+  set_marker "$sb" "test-org/test-repo" 42
+  # Project's own marker: OPEN but NOT migration-labelled -> would BLOCK.
+  mkdir -p "$sb/.claude/session/tickets"
+  printf 'repo=%s\nnumber=%s\n' "test-org/test-repo" 99 > "$sb/.claude/session/tickets/example"
+  install_mock "$sb" gh 'case "$*" in
+  *42*) echo "{\"state\":\"OPEN\",\"labels\":[{\"name\":\"migration\"}],\"body\":\"docs/agdr/AgDR-0001-db-migration.md\"}" ;;
+  *)    echo "{\"state\":\"OPEN\",\"labels\":[],\"body\":\"\"}" ;;
+esac'
+  echo "$sb"
+}
+
+for tilde in '~root' '~+' '~-'; do
+  SB=$(mk_inverted_fixture)
+  STDERR_FILE=$(mktemp)
+  input=$(jq -nc --arg c "cat > $tilde/$MIG" '{tool_name:"Bash", tool_input:{command:$c}}')
+  (
+    cd "$SB" || exit 99
+    PATH="$SB/bin:$PATH" .claude/hooks/require-migration-ticket.sh <<<"$input" >/dev/null 2>"$STDERR_FILE"
+  )
+  rc=$?
+  if [ "$rc" = 2 ] && grep -q "No active ticket set" "$STDERR_FILE"; then
+    record_pass "#1159/H1 '$tilde/' target refuses outright, never reaches the ops ticket"
+  else
+    record_fail "#1159/H1 '$tilde/' target refuses outright, never reaches the ops ticket" \
+      "rc=$rc stderr=$(cat "$STDERR_FILE")"
+  fi
+  rm -f "$STDERR_FILE"
+  rm -rf "$SB"
+done
 
 # =============================================================================
 # Summary

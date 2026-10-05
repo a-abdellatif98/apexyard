@@ -9,7 +9,7 @@ set -u
 SRC_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 RULE_FILE="$SRC_ROOT/.claude/rules/evidence-grounding.md"
 REVIEWER_FILE="$SRC_ROOT/.claude/agents/code-reviewer.md"
-CASES_FILE="$SRC_ROOT/.claude/rules/tests/fixtures/evidence-grounding-cases.md"
+CASES_FILE="$SRC_ROOT/docs/quality-regression/fixtures/evidence-grounding-cases.md"
 AGDR_FILE="$SRC_ROOT/docs/agdr/AgDR-0124-universal-evidence-grounding-contract.md"
 
 PASS=0
@@ -45,7 +45,8 @@ assert "reviewer:runtime-reproduction" grep -qF 'smallest available command or r
 assert "reviewer:claim-states" grep -qF '**Unverified**' "$REVIEWER_FILE"
 assert "reviewer:no-private-identifiers" grep -qF 'do not copy private repository paths' "$REVIEWER_FILE"
 
-assert "wiring:claude" grep -qF '@.claude/rules/evidence-grounding.md' "$SRC_ROOT/CLAUDE.md"
+assert "wiring:claude" grep -qF '.claude/rules/evidence-grounding.md' "$SRC_ROOT/CLAUDE.md"
+assert "wiring:claude-no-at-import" bash -c "! grep -qF '@.claude/rules/evidence-grounding.md' '$SRC_ROOT/CLAUDE.md'"
 assert "wiring:agents" grep -qF '.claude/rules/evidence-grounding.md' "$SRC_ROOT/AGENTS.md"
 assert "wiring:system" grep -qF 'evidence-grounding' "$SRC_ROOT/SYSTEM.md"
 assert "wiring:cursor" grep -qF '.claude/rules/evidence-grounding.md' "$SRC_ROOT/bin/sync-cursor-adapter.sh"
