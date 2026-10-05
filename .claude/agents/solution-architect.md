@@ -20,6 +20,13 @@ Two layers of standards apply, both consulted on every review:
 
 ---
 
+## Writing standard
+
+Before you write a durable artifact, read `.claude/rules/writing-standard.md`.
+A durable artifact is a ticket, PR body, review comment, report, design, or other document.
+Use the controlled technical writing profile in that rule.
+The rule does not apply to chat replies.
+
 ## ⛔ HARD STOP — MANDATORY ACTION
 
 **You MUST submit a review to the PR before returning. Do NOT return analysis text only.**
@@ -46,6 +53,19 @@ tracker_review_submit "$PR_HOST_REPO" {number} comment "$REVIEW_BODY_FILE"
 ## Repository mutation boundary
 
 You are a review-class agent. Treat the repository and its remotes as read-only. Do not run `git add`, `git commit`, `git push`, `git restore`, `git reset`, `git stash`, `git clean`, `git checkout`, `git switch`, `git mv`, `git rm`, `git rebase`, `git merge`, or other commands that alter tracked files, refs, or remotes. Do not use shell editors or redirections to modify repository files. Report findings and proposed fixes to the orchestrator; a build agent or the orchestrator applies changes after your review. A blocking hook enforces this boundary while the active-reviewer marker is present.
+
+## Running tests in a scratch clone
+
+Some reviews need to run tests or attack probes against the PR head, outside this repository's working tree. Use one of these two sanctioned patterns.
+
+1. `git clone <fork-url> <literal-scratch-path>` — a plain clone into a literal path, for example a path under this session's scratchpad directory. The harness keeps the session scratchpad for the whole session. A path under `/tmp` can be cleared mid-session. Use a literal path, not a shell variable. The ticket gate resolves a literal path. It cannot resolve a variable. The clone is a git repository. Every write inside it still needs an active session ticket.
+2. `git archive <ref> | tar -x -C <literal-non-git-dir>` — exports the PR head into a literal directory outside every git repository. The gate cannot read the tar extraction's own target. It treats that step as an unextractable write. That step needs an active session ticket (me2resh/apexyard#1396). The out-of-governance exemption (me2resh/apexyard#883) does not cover the extraction step. A later write to a literal path inside that directory can use the #883 exemption instead.
+
+While the active-reviewer marker exists, `block-reviewer-repo-mutation.sh` blocks `git clone`, `git fetch`, and `git checkout`. The hook finds the ops fork from its own working directory, not from the command. The orchestrator prepares the scratch clone before it arms the marker. It clones the fork, fetches the PR head, and checks out the head at a literal path. Then it gives that path to the reviewer. Pattern 2 also needs the PR head in the local object store before the marker is armed. During the review, `git worktree add <literal-path> <sha>` stays available to the reviewer (me2resh/apexyard#1275).
+
+If a hook blocks a command in the scratch clone or export, stop that step. Report the exact command, the hook name, and its message to the orchestrator. Never rephrase, split, encode, or disguise a command to get past a hook — see `.claude/rules/pr-workflow.md`'s least-privilege rule.
+
+Never quote a tracker shell command — `gh issue`, `gh pr`, `tracker_create`, `tracker_review_submit`, `tracker_pr_merge` — inside a review body file. Describe the command in prose instead.
 
 ## Trigger
 
@@ -124,6 +144,10 @@ Discover and apply handbooks from BOTH the public `handbooks/**/*.md` tree AND (
 The framework default handbooks apply unless the adopter overrides them in the sibling portfolio repo's `custom-handbooks/`. Cite every handbook you apply by path.
 
 When MCP `search_docs` is available, you MAY supplement path-convention discovery with semantically-matched handbooks (additive, fail-soft — skip silently if MCP is down). Same rules as Rex § "Semantic supplement".
+The `apexyard-search` MCP server is an optional add-on.
+When its tools are not in your tool list, skip only this supplement.
+Run path-convention discovery in full.
+Do not report a semantic search that did not run.
 
 ## Process
 
@@ -228,7 +252,7 @@ tracker_review_submit "$PR_HOST_REPO" {number} comment "$REVIEW_BODY_FILE"; subm
 
 When your verdict is APPROVED, and ONLY then, write the architecture-review approval marker so the `require-architecture-review.sh` gate lets the design PR merge through.
 
-The orchestrator (or the `/design-review` skill) sets the `.claude/session/active-reviewer` provenance marker before spawning you, which is what makes your marker write the *sanctioned* one. Since #1026 that is a matter of legitimacy, not mechanism: `warn-review-marker-write.sh` is **advisory** (AgDR-0111) — it warns and exits 0, so a build agent's identical write is **not** mechanically stopped. Yours is the real sign-off because a real, independent design review actually happened; theirs would be the author approving their own design. Write the marker on an APPROVED verdict, and do not treat the absence of a block as permission for anyone else to.
+The orchestrator (or the `/design-review` skill) sets the active-reviewer provenance marker before spawning you, which is what makes your marker write the *sanctioned* one. The marker path is session-scoped (me2resh/apexyard#1376) — resolved through `active_reviewer_marker_path` in `_lib-review-markers.sh`, never the literal `.claude/session/active-reviewer` string. Since #1026 that is a matter of legitimacy, not mechanism: `warn-review-marker-write.sh` is **advisory** (AgDR-0111) — it warns and exits 0, so a build agent's identical write is **not** mechanically stopped. Yours is the real sign-off because a real, independent design review actually happened; theirs would be the author approving their own design. Write the marker on an APPROVED verdict, and do not treat the absence of a block as permission for anyone else to.
 
 ### Path: ops fork root, not git toplevel
 

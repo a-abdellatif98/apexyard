@@ -175,15 +175,25 @@ All subsequent reads in steps 2–6 use `$WORKSPACE_DIR/<name>/` as the repo roo
 >
 > The gap this leaves — a managed-project clone's *own* `.githooks/` still isn't wired up by anything, so its terminal `git push` stays unprotected — is real and deliberately deferred, not silently dropped. The correct shape is for the framework to install **its own** hook into the clone's untracked `.git/hooks/` (never point at a tracked third-party directory), which needs its own design and its own ticket. Do not attempt it here.
 
-### 1.5-reindex. Reindex the cloned repo in MCP (default: always attempt)
+### 1.5-reindex. Reindex the cloned repo in MCP (when the MCP is installed)
 
 After a successful clone (`$CLONE_STATUS=cloned`), trigger an MCP reindex so `search_code` and `search_docs` return results during the deep-dive phases that follow (steps 2–6). Without this step those queries return empty against the just-cloned repo, and the agent silently falls back to `find` + `cat` + `Bash` — defeating the token-cost benefit of cloning early.
+
+The `apexyard-search` MCP server is an optional add-on. Check your tool list for `mcp__apexyard-search__reindex` before the call.
+
+- **Tool absent:** do not call it. Set `REINDEX_STATUS="unavailable"`. Print the line below once, then continue. This is not a failure.
+
+  ```
+  ℹ apexyard-search is not installed — using grep + Read for steps 2–6
+  ```
+
+- **Tool present:** call it.
 
 ```
 mcp__apexyard-search__reindex(scope="project", project="<name>")
 ```
 
-**On MCP unavailable:** the call will error. Catch the error, print a single-line warning, set the marker, and continue. **Do not skip silently** — silent skips are indistinguishable between "server down" and "agent forgot the step", and the second failure mode is what this step exists to prevent.
+**On a failed call:** when the tool is present but the call errors, catch the error, print a single-line warning, set the marker, and continue. **Do not skip silently** — silent skips are indistinguishable between "server down" and "agent forgot the step", and the second failure mode is what this step exists to prevent.
 
 ```
 ⚠ MCP reindex unavailable — falling back to grep + Read for steps 2–6
@@ -193,7 +203,7 @@ mcp__apexyard-search__reindex(scope="project", project="<name>")
 REINDEX_STATUS="indexed"   # or "unavailable" | "skipped" (when $CLONE_STATUS != cloned)
 ```
 
-When `$REINDEX_STATUS="indexed"`, prefer `search_code` and `search_docs` over `grep` + `Read` for the assessment reads in steps 2–6 (per the MCP-search-first rule). When `unavailable` or `skipped`, fall back to `grep` + `Read` without further apology.
+When `$REINDEX_STATUS="indexed"`, prefer `search_code` and `search_docs` over `grep` + `Read` for the assessment reads in steps 2–6 (per the MCP-search-first rule). When `unavailable` or `skipped`, fall back to `grep` + `Read` without further apology. Do every read in steps 2–6 with `grep` + `Read`. Do not skip or shorten a step. Do not report a semantic search or an index that did not run.
 
 A `PostToolUse` hook (`suggest-mcp-reindex-after-clone.sh`) fires after the clone command and emits a one-line reminder of this step. Same advisory shape as `detect-role-trigger.sh` — exit 0, non-blocking, removes the "I forgot the rule applied here" failure mode.
 
@@ -251,16 +261,16 @@ Which harness(es) will drive work on {name}?
 
 - **1 / default / empty** → continue straight to step 2. No further output.
 - **6** → one line — *"No adapter for that harness yet. The mechanical gates (`.claude/hooks/*.sh`) are portable bash; see `docs/harnesses/README.md` § 'Adapter-authoring pattern for future harnesses' if you want to write one."* — then continue to step 2.
-- **2 / 3 / 4 / 5 (one or more)** → for each, print its install command + its one precondition, read fresh from `docs/harnesses/README.md` (single source of truth — don't duplicate the matrix here as a maintained copy). As of the 2026-07-09 matrix:
+- **2 / 3 / 4 / 5 (one or more)** → for each, print its install command + its one precondition, read fresh from `docs/harnesses/README.md` (single source of truth — don't duplicate the matrix here as a maintained copy). Snapshot below. Refresh from the doc before printing:
 
   | Harness | Install | Precondition | Tier |
   |---------|---------|---------------|------|
   | opencode | `bash bin/install-opencode-adapter.sh` | run opencode headless with `--auto` | ✅ live-proven |
   | pi | `bash bin/install-pi-adapter.sh` | run pi headless with `-a` / `--approve` | ✅ live-proven |
   | Codex | `bash bin/sync-codex-adapter.sh` | grant hook-trust — `/hooks` interactively, `--dangerously-bypass-hook-trust` for a one-off headless run, or a user-level `~/.codex/hooks.json` | ✅ live-proven |
-  | Cursor | `bin/install-cursor-adapter.sh` | installs to **user-level** `~/.cursor/hooks.json` | 🟡 **failClosed-only** — not live-proven; the `cursor-agent` CLI ignores hooks entirely |
+  | Cursor | `bash bin/install-cursor-adapter.sh` | enable third-party configs; leftover full adapter must be replaced | ✅ native in the IDE (2026-09-16). CLI ignores hooks. Not in conformance CI |
 
-  **Honesty is load-bearing — never round Cursor up.** State the tier exactly as `docs/harnesses/README.md` does: opencode/pi/Codex are live-proven (a real credentialed model turn was actually blocked by the delegated gate); Cursor only *fails closed* on a hook-runner error, a materially weaker guarantee than verified delegated execution. Link the per-harness page for the full workflow: `docs/harnesses/<harness>.md`.
+  **Honesty is load-bearing — never round a harness's tier up.** Print the current row from `docs/harnesses/README.md`. For Cursor, say native in the IDE, the `cursor-agent` CLI ignores hooks, a leftover full adapter can lock the session, and conformance CI has no headless path. Do not restore the retired failClosed-only claim. Link the per-harness page for the full workflow: `docs/harnesses/<harness>.md`.
 
 **Don't run the install command yourself** — print it, don't execute `bin/install-*-adapter.sh` against the target repo on the operator's behalf. Adapter install is a decision for the team taking ownership, not a side effect of adoption.
 
@@ -1074,6 +1084,31 @@ sequence_template="${SEQUENCE_TEMPLATE:-$(portfolio_resolve_template architectur
 
 Both follow the architecture-stub conventions: write once, never overwrite (preserve on re-handover), and prepend the machine-drafted note. The richer rows (3–6: DFD, Feature Inventory, journey, vision) are **not** generated here — they hand off to `/dfd`, `/extract-features`, `/journey`, `/tech-vision` per step 5.6's hand-off offer.
 
+### 6.2. Lint the generated architecture stubs
+
+Run `lint.sh` against every architecture stub that exists on disk after steps 6 and 6.1 — `container.md`, `context.md`, and any `sequence-<flow>.md`. This block is a fresh process (per the per-block preamble rule above), so re-source the portfolio helper and re-resolve `$projects_dir` rather than reusing a variable from an earlier block. Use `find` to list the files, not a glob — under zsh, an unmatched glob (the common case: no `sequence-*.md` stub exists) prints "no matches found" and aborts the loop with exit 1 before any file lints. The lint wraps the shared `_lib-mermaid-lint.sh` — it extracts every ` ```mermaid ` block from the file and validates each via `mmdc` (mermaid-cli), so broken syntax is caught at write time, not when a human opens the file on GitHub.
+
+```bash
+source "$(git rev-parse --show-toplevel)/.claude/hooks/_lib-portfolio-paths.sh"
+projects_dir=$(portfolio_projects_dir)
+SKILL_DIR="$(git rev-parse --show-toplevel)/.claude/skills/handover"
+arch_dir="${projects_dir}/<name>/architecture"
+find "$arch_dir" -maxdepth 1 -type f \( -name "container.md" -o -name "context.md" -o -name "sequence-*.md" \) | while IFS= read -r stub; do
+  rc=0
+  "$SKILL_DIR/lint.sh" "$stub" || rc=$?
+  echo "lint: $stub exit=$rc"
+done
+```
+
+The loop resets `rc` to 0 before each file's lint call, so the per-file reporting rules below read the exit code for that file only, not a leftover from an earlier one.
+
+Handle each file's exit code before reporting it as written:
+
+- **Exit 0** — clean. Report the stub as `written (Mermaid lint: clean)`.
+- **Exit 1** — parse error. Print the lint output and either fix the offending block and re-lint, or leave the file as-is and note `written (Mermaid lint: FAILED — see output above)` in the summary. Never report a failed stub as plain `written`.
+- **Exit 3** — `mmdc` / Node unavailable. Print the warning `Mermaid not validated: mmdc not available.` and report the stub as `written (Mermaid not validated: mmdc not available)`. Do not report success.
+- **`--skip-lint`** (operator-requested) — report `written (Mermaid lint skipped)`.
+
 ### 7. Append to the portfolio registry
 
 **Don't just print the snippet** — offer to append it automatically:
@@ -1289,10 +1324,10 @@ The repo was cloned in step 1.5-clone (or was already local). Offer follow-up de
 
 **If `$CLONE_STATUS` is `cloned` or `preserved`:**
 
-Print a single follow-up offer after the step 10 summary:
+Print a single follow-up offer after the step 10 summary. Include "and indexed in MCP" only when `$REINDEX_STATUS` is `indexed`.
 
 ```
-✓ <name> is cloned at $WORKSPACE_DIR/<name>/ and indexed in MCP.
+✓ <name> is cloned at $WORKSPACE_DIR/<name>/[ and indexed in MCP].
   Want to run any of the following against the clone now?
 
   1. /threat-model <name>   — STRIDE threat model (recommended for first handover)
@@ -1622,7 +1657,7 @@ If the project is healthy (recent commits, active PRs/issues), skip the prompt e
 ```
 Handover assessment written: projects/{name}/handover-assessment.md
 Document selection:          {"checklist — generated: {list}; deferred (handed off): {list}" | "--all (full set)" | "none (assessment only)"}
-Architecture stub:           projects/{name}/architecture/container.md ({written | preserved | skipped | skipped (deselected)})
+Architecture stub:           projects/{name}/architecture/container.md ({written (Mermaid lint: clean) | written (Mermaid not validated: mmdc not available) | written (Mermaid lint: FAILED — see output above) | preserved | skipped | skipped (deselected)})
 In-repo AGENTS.md:           {PR opened: <url> | preserved (already present) | declined | not selected | skipped (no clone) | failed: <reason>}
 Governed-by-ApexYard badge:  {PR opened: <url> (<variant>) | skipped (already present) | declined | not selected | skipped (no clone) | skipped (no README) | failed: <reason>}
 Topology bundle:             {"<name>@<version> instantiated (handbooks + AgDR draft + CI pipelines)" | "declined" | "skipped (no pick)" | "pipelines pending — workspace not cloned"}
@@ -1676,7 +1711,7 @@ Filed follow-up tickets:
 21. **`AGENTS.md` is opt-in, PR-delivered, and never overwrites** — the in-repo `AGENTS.md` (step 8.5) is the only artefact written into the target repo, and it is **default-OFF** so Rule 1 holds unless the operator opts in. It is delivered via a branch + PR (never a direct commit to the default branch; never via the ops-fork bootstrap-exempt path). An existing `AGENTS.md` or `CLAUDE.md` is **preserved, never overwritten** — exactly like the architecture stubs (Rule 11). `AGENTS.md` is canonical; a one-line `CLAUDE.md` importing it (`@AGENTS.md`) is offered only when no `CLAUDE.md` exists. The file carries a "generated by `/handover` on `<date>` — review & refine" note and stays focused on stable info (commands, layout, conventions). Refresh is manual (delete + re-run). See AgDR-0073.
 22. **`AGENTS.md` and `handover-assessment.md` don't duplicate — they split by reader** — `handover-assessment.md` (ops fork) is the **operator's** full analysis: risks, harnessability verdict, integration plan, next-step tickets. `AGENTS.md` (in the target repo) is the **agent's** concise operating manual: stable commands, layout, conventions, and the up-front gotchas an agent needs to start working. The volatile risk/integration analysis stays in the assessment; it is not copied into `AGENTS.md`. For low-harnessability repos, `AGENTS.md`'s Gotchas section surfaces what's fragile/missing (no strict types, no lint baseline, no coverage signal) — the in-repo echo of the assessment's LOW warning.
 23. **The "Governed by ApexYard" badge (step 8.6) is opt-in, PR-delivered, idempotent, and never a default** — row 9 of the step 5.6 checklist is **default-OFF** in every mode (checklist default, `--all`, and interactive `all`); it is only generated when explicitly ticked or comma-listed. Every run confirms with the operator by name (`Add a "Governed by ApexYard" badge to <name>'s README?`) before touching the target repo — there is no silent or bulk-implied consent for an externally-visible README edit. The badge is delivered via a branch + PR exactly like `AGENTS.md` (never a direct commit). It is **idempotent**: if either badge variant (`governed_by` or `built_with`) is already present in the README, the step skips and reports `already present` rather than adding a duplicate or swapping variants. The badge markdown itself (URL, color `#2F6DF6`, `flat-square` style) is fixed and quoted verbatim in step 8.6 — don't re-derive it. See AgDR-0090.
-24. **`docs/harnesses/README.md` is the single source of truth for harness support — step 1.6 summarises and links it, never duplicates the matrix.** Read the doc fresh when printing a harness's install command, precondition, or tier rather than trusting a stale table baked into this skill. Never round a harness's tier up — Cursor is failClosed-only, not live-proven, and the skill says so verbatim. Step 1.6 is informational only: it prints the adapter install command but never runs it against the target repo.
+24. **`docs/harnesses/README.md` is the single source of truth for harness support — step 1.6 summarises and links it, never duplicates the matrix.** Read the doc fresh when printing a harness's install command, precondition, or tier rather than trusting a stale table baked into this skill. Never round a harness's tier up. Do not restore the retired failClosed-only claim for Cursor. Step 1.6 is informational only: it prints the adapter install command but never runs it against the target repo.
 25. **The branch-protection check (step 1.7) is advisory and fail-open, never a gate.** It never blocks the rest of `/handover`, never retries, and never escalates a check failure into anything stronger than the one-line nudge. It exists because AgDR-0115 accepted that ApexYard installs no client-side push protection into a managed-project clone — the nudge is the only signal the operator gets that the *actual* control (the forge's own server-side branch protection) might be off. Dispatch on `tracker_kind` (`.claude/hooks/_lib-tracker.sh`), the same pattern `tracker_review_submit`/`tracker_pr_merge` use — never hardcode one forge's CLI or REST shape. `custom` and `none` tracker kinds get a generic manual-check note, not a guessed API call.
 
 ## When to use this

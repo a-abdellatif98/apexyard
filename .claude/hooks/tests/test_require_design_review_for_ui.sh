@@ -44,20 +44,20 @@ assert_eq() {
 }
 
 # ---------------------------------------------------------------------------
-# A) UI_GLOBS — the default UI patterns the hook ships with. Kept in sync with
-# the hook by copying the same list; the matcher replays the hook's grep, which
-# is case-SENSITIVE (grep -qE, NOT -i) — .tsx$/.jsx$ are exact so they do not
-# match plain .ts/.js backend files.
+# A) UI_GLOBS — the default UI patterns the hook ships with. Sourced from the
+# SAME _lib-ui-paths.sh the hook (and /approve-design) read (me2resh/apexyard#1390)
+# — no separate copy to drift out of sync. The matcher replays the hook's
+# grep, which is case-SENSITIVE (grep -qE, NOT -i) — .tsx$/.jsx$ are exact so
+# they do not match plain .ts/.js backend files.
 # ---------------------------------------------------------------------------
-UI_GLOBS='\.tsx$
-\.jsx$
-\.vue$
-\.svelte$
-\.css$
-\.scss$
-\.sass$
-\.less$
-design-tokens'
+LIB_UI_PATHS="$SRC_ROOT/.claude/hooks/_lib-ui-paths.sh"
+if [ ! -f "$LIB_UI_PATHS" ]; then
+  echo "FAIL: required source missing: $LIB_UI_PATHS" >&2
+  exit 1
+fi
+# shellcheck source=/dev/null
+. "$LIB_UI_PATHS"
+UI_GLOBS=$(ui_default_globs)
 
 classify_file() {
   local file="$1"
@@ -76,6 +76,11 @@ assert_eq "tsx component matches"   "match"    "$(classify_file 'src/components/
 assert_eq "jsx component matches"   "match"    "$(classify_file 'src/App.jsx')"
 assert_eq "vue component matches"   "match"    "$(classify_file 'src/Card.vue')"
 assert_eq "svelte component matches" "match"   "$(classify_file 'src/Nav.svelte')"
+assert_eq "astro component matches" "match"    "$(classify_file 'src/layouts/Base.astro')"
+assert_eq "mdx component matches"   "match"    "$(classify_file 'src/pages/about.mdx')"
+assert_eq "hbs template matches"    "match"    "$(classify_file 'views/index.hbs')"
+assert_eq "njk template matches"    "match"    "$(classify_file 'templates/index.njk')"
+assert_eq "liquid template matches" "match"    "$(classify_file 'templates/index.liquid')"
 assert_eq "css matches"             "match"    "$(classify_file 'styles/main.css')"
 assert_eq "scss matches"            "match"    "$(classify_file 'styles/theme.scss')"
 assert_eq "design-tokens matches"   "match"    "$(classify_file 'src/design-tokens.json')"
@@ -86,6 +91,19 @@ assert_eq "plain .ts no-match"      "no-match" "$(classify_file 'src/handlers/us
 assert_eq "plain .js no-match"      "no-match" "$(classify_file 'scripts/build.js')"
 assert_eq "readme no-match"         "no-match" "$(classify_file 'README.md')"
 assert_eq "go file no-match"        "no-match" "$(classify_file 'cmd/main.go')"
+
+echo ""
+echo "A) ui_effective_globs_pipe — the single grep -E argument /approve-design step 5 reads"
+PIPE_DEFAULT=$(ui_effective_globs_pipe "")
+assert_eq "pipe form matches .astro (default list)" "0" "$(printf 'src/layouts/Base.astro' | grep -qE "$PIPE_DEFAULT"; echo $?)"
+assert_eq "pipe form does not match plain .ts (default list)" "1" "$(printf 'src/handlers/user.ts' | grep -qE "$PIPE_DEFAULT"; echo $?)"
+
+pipe_sb=$(mktemp -d)
+mkdir -p "$pipe_sb/.claude"
+printf '%s\n' '{"ui_paths": ["\\.foo$"]}' > "$pipe_sb/.claude/project-config.json"
+PIPE_OVERRIDE=$(ui_effective_globs_pipe "$pipe_sb")
+assert_eq "pipe form reads .ui_paths override" "\\.foo\$" "$PIPE_OVERRIDE"
+rm -rf "$pipe_sb"
 
 # ---------------------------------------------------------------------------
 # B) End-to-end gate via self-contained mock gh.
@@ -101,9 +119,18 @@ make_sandbox() {
   cp "$SRC_ROOT/.claude/hooks/_lib-extract-pr.sh" "$sb/.claude/hooks/_lib-extract-pr.sh"
   cp "$SRC_ROOT/.claude/hooks/_lib-review-markers.sh" "$sb/.claude/hooks/_lib-review-markers.sh"
   cp "$SRC_ROOT/.claude/hooks/_lib-pr-repo.sh" "$sb/.claude/hooks/_lib-pr-repo.sh"
+  cp "$SRC_ROOT/.claude/hooks/_lib-ui-paths.sh" "$sb/.claude/hooks/_lib-ui-paths.sh"
   if [ -f "$SRC_ROOT/.claude/hooks/_lib-ops-root.sh" ]; then
     cp "$SRC_ROOT/.claude/hooks/_lib-ops-root.sh" "$sb/.claude/hooks/_lib-ops-root.sh"
   fi
+  # The hook itself, so a test can corrupt the SANDBOX's own
+  # _lib-ui-paths.sh and see the effect. run_gate always invokes $HOOK_SRC
+  # (the source tree's absolute path), so `dirname "$0"` there resolves back
+  # to the source tree regardless of what this sandbox holds — the earlier
+  # cp above never actually reached the hook. run_gate_sandboxed below runs
+  # this copy instead, so `dirname "$0"` resolves inside the sandbox
+  # (me2resh/apexyard#1397 HIGH-1).
+  cp "$HOOK_SRC" "$sb/.claude/hooks/require-design-review-for-ui.sh"
   echo "$sb"
 }
 
@@ -144,6 +171,18 @@ run_gate() {
   echo $?
 }
 
+# Runs the SANDBOX's own copy of the hook, not $HOOK_SRC — so `dirname "$0"`
+# resolves to $sb/.claude/hooks and the hook sources the sandbox's own
+# _lib-ui-paths.sh. A test can corrupt or remove that one file and see the
+# effect (me2resh/apexyard#1397 HIGH-1) without touching the real source tree.
+run_gate_sandboxed() {
+  local sb="$1" command="$2"
+  local input
+  input=$(printf '{"tool_input":{"command":"%s"}}' "$command")
+  ( cd "$sb" && APEXYARD_OPS_DISABLE_PIN=1 PATH="$sb/bin:$PATH" bash "$sb/.claude/hooks/require-design-review-for-ui.sh" >/dev/null 2>&1 <<< "$input" )
+  echo $?
+}
+
 SHA="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 echo ""
@@ -152,6 +191,14 @@ sb=$(make_sandbox)
 install_mock_gh "$sb" '"src/components/Button.tsx"' "$SHA"
 code=$(run_gate "$sb" "gh pr merge 77 --repo o/r --squash")
 assert_eq "blocks without marker" "2" "$code"
+rm -rf "$sb"
+
+echo ""
+echo "B) #1390 regression — Astro-only PR + NO marker -> BLOCK (exit 2)"
+sb=$(make_sandbox)
+install_mock_gh "$sb" '"src/layouts/SiteMenu.astro"' "$SHA"
+code=$(run_gate "$sb" "gh pr merge 77 --repo o/r --squash")
+assert_eq "#1390 blocks astro-only PR without marker" "2" "$code"
 rm -rf "$sb"
 
 echo ""
@@ -178,6 +225,67 @@ sb=$(make_sandbox)
 install_mock_gh "$sb" '"src/handlers/user.ts" "cmd/main.go"' "$SHA"
 code=$(run_gate "$sb" "gh pr merge 77 --repo o/r --squash")
 assert_eq "no-op on non-UI PR" "0" "$code"
+rm -rf "$sb"
+
+echo ""
+echo "B) .ui_paths override still REPLACES the shared default list (#1390 refactor didn't change override semantics)"
+sb=$(make_sandbox)
+mkdir -p "$sb/.claude"
+printf '%s\n' '{"ui_paths": ["\\.foo$"]}' > "$sb/.claude/project-config.json"
+install_mock_gh "$sb" '"src/layouts/SiteMenu.astro"' "$SHA"
+code=$(run_gate "$sb" "gh pr merge 77 --repo o/r --squash")
+assert_eq "overridden .ui_paths no longer matches .astro" "0" "$code"
+rm -rf "$sb"
+
+echo ""
+echo "B) malformed .ui_paths entries fall back to the shipped defaults, not to an empty (always-passing) list (Hakim LOW-2, me2resh/apexyard#1397)"
+echo "B) [null] -> the pattern list falls back to defaults -> UI PR with no marker BLOCKS (exit 2)"
+sb=$(make_sandbox)
+mkdir -p "$sb/.claude"
+printf '%s\n' '{"ui_paths": [null]}' > "$sb/.claude/project-config.json"
+install_mock_gh "$sb" '"src/components/Button.tsx"' "$SHA"
+code=$(run_gate "$sb" "gh pr merge 77 --repo o/r --squash")
+assert_eq "[null] override falls back to defaults, blocks .tsx PR" "2" "$code"
+rm -rf "$sb"
+
+echo ""
+echo "B) [{}] (an object entry) -> falls back to defaults -> BLOCKS (exit 2)"
+sb=$(make_sandbox)
+mkdir -p "$sb/.claude"
+printf '%s\n' '{"ui_paths": [{"a": 1}]}' > "$sb/.claude/project-config.json"
+install_mock_gh "$sb" '"src/layouts/SiteMenu.astro"' "$SHA"
+code=$(run_gate "$sb" "gh pr merge 77 --repo o/r --squash")
+assert_eq "[{}] override falls back to defaults, blocks .astro PR" "2" "$code"
+rm -rf "$sb"
+
+echo ""
+echo "B) [[]] (a nested array entry) -> falls back to defaults -> BLOCKS (exit 2)"
+sb=$(make_sandbox)
+mkdir -p "$sb/.claude"
+printf '%s\n' '{"ui_paths": [["x"]]}' > "$sb/.claude/project-config.json"
+install_mock_gh "$sb" '"src/components/Button.tsx"' "$SHA"
+code=$(run_gate "$sb" "gh pr merge 77 --repo o/r --squash")
+assert_eq "[[]] override falls back to defaults, blocks .tsx PR" "2" "$code"
+rm -rf "$sb"
+
+echo ""
+echo "B) [\" \"] (a whitespace-only string entry) -> falls back to defaults -> BLOCKS (exit 2)"
+sb=$(make_sandbox)
+mkdir -p "$sb/.claude"
+printf '%s\n' '{"ui_paths": [" "]}' > "$sb/.claude/project-config.json"
+install_mock_gh "$sb" '"src/layouts/SiteMenu.astro"' "$SHA"
+code=$(run_gate "$sb" "gh pr merge 77 --repo o/r --squash")
+assert_eq "[' '] override falls back to defaults, blocks .astro PR" "2" "$code"
+rm -rf "$sb"
+
+echo ""
+echo "B) a mix of malformed and valid .ui_paths entries keeps only the valid one (no fallback)"
+sb=$(make_sandbox)
+mkdir -p "$sb/.claude"
+printf '%s\n' '{"ui_paths": [null, "\\.foo$", " "]}' > "$sb/.claude/project-config.json"
+install_mock_gh "$sb" '"src/components/Button.tsx"' "$SHA"
+code=$(run_gate "$sb" "gh pr merge 77 --repo o/r --squash")
+assert_eq "mixed override keeps only the valid entry, .tsx (not .foo) is a no-op" "0" "$code"
 rm -rf "$sb"
 
 echo ""
@@ -397,6 +505,114 @@ chmod +x "$sb/bin/gh"
 code=$(run_gate "$sb" "gh pr merge 77 --repo o/r --squash")
 assert_eq "#1151 unresolvable diff blocks" "2" "$code"
 rm -rf "$sb"
+
+echo ""
+echo "G) #1397 HIGH-1: _lib-ui-paths.sh fails to load -> fail CLOSED"
+# Runs the hook from ITS OWN sandbox copy (run_gate_sandboxed), so corrupting
+# the sandbox's _lib-ui-paths.sh actually reaches the hook under test.
+
+sb=$(make_sandbox)
+install_mock_gh "$sb" '"src/components/Button.tsx"' "$SHA"
+code=$(run_gate_sandboxed "$sb" "gh pr merge 77 --repo o/r --squash")
+assert_eq "#1397 sandboxed baseline: healthy library, UI file, no marker -> blocks" "2" "$code"
+rm -rf "$sb"
+
+sb=$(make_sandbox)
+install_mock_gh "$sb" '"src/components/Button.tsx"' "$SHA"
+rm -f "$sb/.claude/hooks/_lib-ui-paths.sh"
+code=$(run_gate_sandboxed "$sb" "gh pr merge 77 --repo o/r --squash")
+assert_eq "#1397 missing library -> blocks, was fail-open before the fix" "2" "$code"
+rm -rf "$sb"
+
+sb=$(make_sandbox)
+install_mock_gh "$sb" '"src/components/Button.tsx"' "$SHA"
+: > "$sb/.claude/hooks/_lib-ui-paths.sh"
+code=$(run_gate_sandboxed "$sb" "gh pr merge 77 --repo o/r --squash")
+assert_eq "#1397 empty library -> blocks" "2" "$code"
+rm -rf "$sb"
+
+sb=$(make_sandbox)
+install_mock_gh "$sb" '"src/components/Button.tsx"' "$SHA"
+chmod 000 "$sb/.claude/hooks/_lib-ui-paths.sh"
+code=$(run_gate_sandboxed "$sb" "gh pr merge 77 --repo o/r --squash")
+assert_eq "#1397 unreadable (mode 000) library -> blocks" "2" "$code"
+chmod 644 "$sb/.claude/hooks/_lib-ui-paths.sh"
+rm -rf "$sb"
+
+sb=$(make_sandbox)
+install_mock_gh "$sb" '"src/handlers/user.ts"' "$SHA"
+code=$(run_gate_sandboxed "$sb" "gh pr merge 77 --repo o/r --squash")
+assert_eq "#1397 control: healthy library, non-UI file -> still allowed" "0" "$code"
+rm -rf "$sb"
+
+echo ""
+echo "H) missing required library blocks (me2resh/apexyard#1405 H2)"
+# me2resh/apexyard#1405 second-round review, Hakim H2: a missing required
+# library must BLOCK in DEFAULT bash, not just under POSIXLY_CORRECT — see
+# block-unreviewed-merge.sh's own copy of this test for the full
+# rationale. Runs an independent, self-contained copy of the hook (own
+# HOOK_DIR) so removing a library here cannot affect the real repo.
+# _lib-pr-repo.sh is included here (unlike its optional treatment in
+# block-unreviewed-merge.sh / block-merge-on-red-ci.sh) because this hook
+# has always sourced it unconditionally and now guards it the same way.
+for lib in _lib-extract-pr.sh _lib-review-markers.sh _lib-pr-repo.sh; do
+  for mode in default posix; do
+    sb=$(mktemp -d)
+    mkdir -p "$sb/.claude/hooks"
+    cp "$HOOK_SRC" "$sb/.claude/hooks/require-design-review-for-ui.sh"
+    cp "$SRC_ROOT/.claude/hooks/_lib-extract-pr.sh" "$sb/.claude/hooks/_lib-extract-pr.sh"
+    cp "$SRC_ROOT/.claude/hooks/_lib-review-markers.sh" "$sb/.claude/hooks/_lib-review-markers.sh"
+    cp "$SRC_ROOT/.claude/hooks/_lib-pr-repo.sh" "$sb/.claude/hooks/_lib-pr-repo.sh"
+    chmod +x "$sb/.claude/hooks/require-design-review-for-ui.sh"
+    rm -f "$sb/.claude/hooks/$lib"
+    input=$(printf '{"tool_input":{"command":"%s"}}' "gh pr merge 500 --repo o/r --squash")
+    if [ "$mode" = "posix" ]; then
+      got_stderr=$(cd "$sb" && bash -c "echo '$input' | POSIXLY_CORRECT=1 bash .claude/hooks/require-design-review-for-ui.sh" 2>&1 >/dev/null)
+    else
+      got_stderr=$(cd "$sb" && bash -c "echo '$input' | bash .claude/hooks/require-design-review-for-ui.sh" 2>&1 >/dev/null)
+    fi
+    got_rc=$?
+    rm -rf "$sb"
+    label="missing-$lib-blocks-in-$mode-bash"
+    if [ "$got_rc" = "2" ] && echo "$got_stderr" | grep -qi "BLOCKED"; then
+      echo "PASS [$label]"; PASS=$((PASS+1))
+    else
+      echo "FAIL [$label]: want rc=2 + BLOCKED, got rc=$got_rc stderr=${got_stderr:0:300}" >&2
+      FAIL=$((FAIL+1))
+    fi
+  done
+done
+
+# me2resh/apexyard#1403 comment (Adel's follow-up on Hakim's matrix): a
+# missing _lib-ui-paths.sh must ALSO block in POSIX mode by itself, not
+# only via the dispatcher's fail-closed wrapper. Before this hook's
+# readability pre-check, sourcing a missing _lib-ui-paths.sh from inside
+# `if ! . ... || ...` still ended a non-interactive POSIX-mode shell
+# immediately — the BLOCKED branch a few lines below was unreachable, so
+# only the dispatcher (AgDR-0169) caught this case. Confirms the gate now
+# blocks by itself in both modes.
+for mode in default posix; do
+  sb=$(make_sandbox)
+  install_mock_gh "$sb" '"src/components/Button.tsx"' "$SHA"
+  rm -f "$sb/.claude/hooks/_lib-ui-paths.sh"
+  input=$(printf '{"tool_input":{"command":"%s"}}' "gh pr merge 77 --repo o/r --squash")
+  if [ "$mode" = "posix" ]; then
+    got_stderr=$(cd "$sb" && APEXYARD_OPS_DISABLE_PIN=1 PATH="$sb/bin:$PATH" bash -c \
+      "echo '$input' | POSIXLY_CORRECT=1 bash .claude/hooks/require-design-review-for-ui.sh" 2>&1 >/dev/null)
+  else
+    got_stderr=$(cd "$sb" && APEXYARD_OPS_DISABLE_PIN=1 PATH="$sb/bin:$PATH" bash -c \
+      "echo '$input' | bash .claude/hooks/require-design-review-for-ui.sh" 2>&1 >/dev/null)
+  fi
+  got_rc=$?
+  rm -rf "$sb"
+  label="missing-_lib-ui-paths.sh-blocks-in-$mode-bash-by-itself"
+  if [ "$got_rc" = "2" ] && echo "$got_stderr" | grep -qi "BLOCKED"; then
+    echo "PASS [$label]"; PASS=$((PASS+1))
+  else
+    echo "FAIL [$label]: want rc=2 + BLOCKED, got rc=$got_rc stderr=${got_stderr:0:300}" >&2
+    FAIL=$((FAIL+1))
+  fi
+done
 
 echo ""
 echo "==================================="

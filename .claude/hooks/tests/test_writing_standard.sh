@@ -5,7 +5,7 @@ set -u
 
 SRC_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 RULE_FILE="$SRC_ROOT/.claude/rules/writing-standard.md"
-CASES_FILE="$SRC_ROOT/.claude/rules/tests/fixtures/human-friendly-cases.md"
+CASES_FILE="$SRC_ROOT/docs/quality-regression/fixtures/human-friendly-cases.md"
 AGDR_FILE="$SRC_ROOT/docs/agdr/AgDR-0134-controlled-technical-writing-profile.md"
 REX_FILE="$SRC_ROOT/.claude/agents/code-reviewer.md"
 
@@ -72,9 +72,61 @@ while IFS= read -r skill; do
   assert "consumer:$skill:profile" grep -qF 'controlled technical writing profile' "$SRC_ROOT/.claude/skills/$skill/SKILL.md"
 done < <(find "$SRC_ROOT/.claude/skills" -mindepth 2 -maxdepth 2 -name SKILL.md -exec sh -c 'basename "$(dirname "$1")"' _ {} \; | sort)
 assert "consumer:code-reviewer:profile" grep -qF 'controlled technical writing profile' "$SRC_ROOT/.claude/agents/code-reviewer.md"
-assert "reviewer:code-review" grep -qF 'you must request changes' "$SRC_ROOT/.claude/skills/code-review/SKILL.md"
-assert "reviewer:design-review" grep -qF 'you must request changes' "$SRC_ROOT/.claude/skills/design-review/SKILL.md"
-assert "reviewer:rex" grep -qF 'Request changes when the artifact fails the profile' "$SRC_ROOT/.claude/agents/code-reviewer.md"
+
+# Every agent can write a durable artifact: a review, report, ticket, design,
+# or PR body. A direct Agent-tool start skips the skill text, so each agent
+# file must tell the agent to read the rule itself (me2resh/apexyard#1385).
+# Only the body counts. A path in YAML frontmatter is not an instruction.
+agent_body() {
+  awk 'NR==1 && /^---[[:space:]]*$/ {fm=1; next}
+       fm && /^---[[:space:]]*$/ {fm=0; next}
+       !fm {print}' "$1"
+}
+agent_loads_writing_rule() {
+  agent_body "$1" | grep -qiE 'read `?\.claude/rules/writing-standard\.md'
+}
+agent_names_profile() {
+  agent_body "$1" | grep -qF 'controlled technical writing profile'
+}
+not() { ! "$@"; }
+
+AGENT_COUNT=0
+while IFS= read -r agent_file; do
+  AGENT_COUNT=$((AGENT_COUNT+1))
+  agent=$(basename "$agent_file" .md)
+  assert "agent:$agent:loads-rule" agent_loads_writing_rule "$agent_file"
+  assert "agent:$agent:profile" agent_names_profile "$agent_file"
+done < <(find "$SRC_ROOT/.claude/agents" -maxdepth 1 -type f -name '*.md' | sort)
+assert "agent:discovered" test "$AGENT_COUNT" -gt 0
+
+# Negative cases: the check must fail for an agent without the instruction.
+AGENT_FIXTURES=$(mktemp -d)
+trap 'rm -rf "$AGENT_FIXTURES"' EXIT
+cat > "$AGENT_FIXTURES/no-rule.md" <<'EOF'
+---
+name: no-rule
+description: Posts reviews. Names .claude/rules/writing-standard.md only here.
+---
+
+# Fixture agent
+
+Review the PR and post the review.
+EOF
+cat > "$AGENT_FIXTURES/mention-only.md" <<'EOF'
+---
+name: mention-only
+description: Posts reviews.
+---
+
+# Fixture agent
+
+See .claude/rules/writing-standard.md for background.
+EOF
+assert "agent:negative:frontmatter-only-fails" not agent_loads_writing_rule "$AGENT_FIXTURES/no-rule.md"
+assert "agent:negative:mention-without-read-fails" not agent_loads_writing_rule "$AGENT_FIXTURES/mention-only.md"
+assert "reviewer:code-review" grep -qF 'request changes only for that kind of fault' "$SRC_ROOT/.claude/skills/code-review/SKILL.md"
+assert "reviewer:design-review" grep -qF 'Request changes only when the' "$SRC_ROOT/.claude/skills/design-review/SKILL.md"
+assert "reviewer:rex" grep -qF 'Request changes when the profile fault changes meaning or drops evidence' "$SRC_ROOT/.claude/agents/code-reviewer.md"
 assert "reviewer:skill-output-format" grep -qF "agent's required Output Format" "$SRC_ROOT/.claude/skills/code-review/SKILL.md"
 assert "reviewer:all-review-scopes" grep -qF 'first reviews, re-reviews, and reduced-scope reviews' "$REX_FILE"
 assert "reviewer:checklist-evidence" grep -qF 'Give each checklist result a brief reason or an evidence reference.' "$REX_FILE"
